@@ -193,11 +193,7 @@ monitor_speed = 115200
 ## 🏆 **USER TESTIMONIALS:**
 
 ### **Portal Attack Success:**
-> *"we are now attacking nemos evil portal. and pretty fast..... oh shit its hitting both of them. or at least it hit bruce once so far. everything is looking damn good."*
-
-### **Navigation Success:**
-> *"nice job! It pops up when the networks load up."*
-> *"Excellent. they look great lets try to duplicate it"*
+> *"we are now attacking nemos evil portal. and pretty fast..... oh shit its hitting both of them. or at least it hit bruce once so far. Oh bruce crashes! everything is looking damn good."*
 
 ### **The Favorite Feature:**
 > *"now it looks bad ass. and has my favorite feature I had debated adding. Thats why its last. Just. Well if you really want to do something about it mode."*
@@ -211,6 +207,7 @@ monitor_speed = 115200
 - Only use on networks you **own** or have **explicit permission** to test
 - **Respect local laws** and regulations regarding WiFi security testing
 - The author is **not responsible** for misuse or illegal activities
+- Note: this the portal killer could potentially disrupt NON evil portals. 
 
 ### **Responsible Use:**
 - Use for **penetration testing** with proper authorization
