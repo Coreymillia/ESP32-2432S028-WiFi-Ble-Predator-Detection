@@ -12,7 +12,7 @@
 
 ## ⚡ **What Makes This BADASS:**
 
-### 🎯 **Active Countermeasures - The "Well If You Really Want To Do Something About It" Mode**
+### 🎯 **Active Countermeasures - 
 Unlike passive scanners, AntiPredCYD **FIGHTS BACK** against evil portals:
 - **Detects** Bruce (192.168.4.1) AND Nemo (172.0.0.1) style portals
 - **Attacks** with overwhelming credential spam: **"Caught Ya Slippin Ya Damn Fool"**
@@ -37,7 +37,7 @@ Unlike passive scanners, AntiPredCYD **FIGHTS BACK** against evil portals:
 5. **Credential Alert** - Monitors handshake harvesting attempts
 
 ### **⚔️ Active Countermeasures:**
-6. **Portal Killer** - **THE BADASS FEATURE**
+6. **Portal Killer** - 
    - **Dual Portal Detection**: Auto-identifies portal types
    - **Bruce Attack**: 72 attempts (8 endpoints × 3 formats × 3 rounds)
    - **Nemo Attack**: 20 attempts (10 rounds × 2 formats)
