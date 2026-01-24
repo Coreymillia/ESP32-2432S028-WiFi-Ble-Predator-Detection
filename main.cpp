@@ -62,7 +62,8 @@ enum MenuState {
   SETTINGS,
   ABOUT_INFO,
   MATRIX_SCREENSAVER,
-  SYSTEM_STATS
+  SYSTEM_STATS,
+  COUNTERMEASURES
 };
 
 MenuState currentMenu = MAIN_MENU;
@@ -92,15 +93,22 @@ const char* moreOptionsItems[] = {
   "Export Logs",
   "System Stats", 
   "Matrix Screensaver",
+  "Countermeasures",
   "About/Info"
 };
-const int moreOptionsCount = 4;
+const int moreOptionsCount = 5;
 int selectedMenuItem = 0;
 int selectedMoreOption = 0;
 
 // Status variables
 bool isScanning = false;
 String statusMessage = "Ready";
+
+// Navigation variables for scrollable lists
+int network_scroll_offset = 0;
+const int NETWORKS_PER_PAGE = 6;
+int shady_scroll_offset = 0;
+const int SHADY_NETWORKS_PER_PAGE = 6;
 
 // SD Card logging variables
 bool sdCardAvailable = false;
@@ -281,6 +289,60 @@ const char* suspicious_names[] = {
 };
 const int suspicious_names_count = sizeof(suspicious_names) / sizeof(suspicious_names[0]);
 
+// Portal Killer (Countermeasures) variables
+bool countermeasures_active = false;
+uint32_t portals_found = 0;
+uint32_t counter_messages_sent = 0;
+uint32_t last_portal_scan = 0;
+uint32_t last_counter_message = 0;
+const uint32_t PORTAL_SCAN_INTERVAL = 10000; // Scan every 10 seconds (more aggressive)
+const uint32_t COUNTER_MESSAGE_INTERVAL = 5000; // Attack every 5 seconds
+
+struct PortalInfo {
+  String ssid;
+  String bssid;
+  int32_t rssi;
+  uint8_t channel;
+  uint32_t last_seen;
+  bool is_portal;
+  
+  PortalInfo(const String& s, const String& b, int32_t r, uint8_t c) 
+    : ssid(s), bssid(b), rssi(r), channel(c), last_seen(millis()), is_portal(false) {}
+};
+
+std::vector<PortalInfo> detected_portals;
+
+// Portal patterns to detect (common captive portal SSIDs + Evil portals)
+const char* portal_patterns[] = {
+  "Free WiFi", "Guest", "Public", "Hotel", "Airport", "Coffee", "McDonald", 
+  "Starbucks", "xfinitywifi", "attwifi", "AndroidAP", "iPhone", "Samsung",
+  "TP-Link", "NETGEAR", "Linksys", "Belkin", "D-Link", "Motorola",
+  // Evil portal patterns
+  "Evil", "Portal", "Captive", "Login", "WiFi", "Internet", "Access",
+  "M5Stack", "Bruce", "Nemo", "Flipper", "Pwnagotchi"
+};
+const int portal_patterns_count = sizeof(portal_patterns) / sizeof(portal_patterns[0]);
+
+// Counter message beacon packet template
+uint8_t counter_beacon_packet[] = {
+  0x80, 0x00, 0x00, 0x00, // Frame Control, Flags, Duration
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // Destination MAC (broadcast)
+  0x02, 0x00, 0x00, 0x00, 0x00, 0x00, // Source MAC (will be randomized)
+  0x02, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID (same as source)
+  0x00, 0x00, // Sequence number
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Timestamp
+  0x64, 0x00, // Beacon interval
+  0x01, 0x04, // Capability info
+  0x00, 0x00, // SSID length (will be set)
+  // SSID will be inserted here (32 bytes max)
+  0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+  0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+  0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+  0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+  0x01, 0x08, 0x82, 0x84, 0x8b, 0x96, 0x24, 0x30, 0x48, 0x6c, // Supported rates
+  0x03, 0x01, 0x06 // DS Parameter (channel 6, will be updated)
+};
+
 // Function prototypes
 void displayMainMenu();
 void displayMoreOptionsMenu();
@@ -291,6 +353,7 @@ void setLED(uint8_t r, uint8_t g, uint8_t b);
 void flashLED(uint8_t r, uint8_t g, uint8_t b, int duration);
 void drawButton(int x, int y, int w, int h, const char* text, bool selected);
 void drawCenteredText(const char* text, int y, uint16_t color);
+void drawGridBackground();
 
 // Matrix Screensaver functions
 void initMatrixScreensaver();
@@ -343,6 +406,17 @@ void logThreat(const String& threatType, const String& details, int rssi = 0, in
 bool isNewThreat(const String& threatType, const String& details);
 void initializeLogFile();
 
+// Countermeasures (Portal Killer) functions
+void start_countermeasures();
+void stop_countermeasures();
+void scan_for_portals();
+void send_counter_messages();
+void attack_bruce_portal(const String& gateway);
+void attack_nemo_portal(const String& gateway);
+bool is_portal_network(const String& ssid);
+void send_counter_beacon(const String& ssid, uint8_t channel);
+void displayCountermeasures();
+
 // BLE Callback class
 class BLEHunterCallback : public BLEAdvertisedDeviceCallbacks {
 public:
@@ -365,13 +439,17 @@ void setup() {
     gfx->setRotation(1); // Landscape
     gfx->fillScreen(BLACK);
     
-    // Startup screen
+    // Startup screen - NEON STYLE!
     gfx->setTextColor(WHITE);
     gfx->setTextSize(2);
-    drawCenteredText("AntiPredCYD", 60, WHITE);
+    drawCenteredText("PREDATOR DEFENSE", 50, RGB565(255, 0, 0));  // BRIGHT RED!
+    
+    // Add neon accent line
+    gfx->drawFastHLine(50, 70, 220, RGB565(255, 0, 255));  // Bright magenta line
+    
     gfx->setTextSize(1);
-    drawCenteredText("Security Framework", 90, GREEN);
-    drawCenteredText("Initializing...", 130, YELLOW);
+    drawCenteredText(">> SECURITY FRAMEWORK <<", 85, RGB565(0, 255, 0));  // Bright green
+    drawCenteredText("INITIALIZING SYSTEMS...", 130, RGB565(255, 255, 0));  // Bright yellow
     
     delay(2000);
     
@@ -481,16 +559,20 @@ void loop() {
                 gfx->printf("Networks:%d  Open:%d  Hidden:%d", 
                            all_networks.size(), open_networks, hidden_networks);
                 
-                // Show available networks header
+                // Show available networks header with page info
                 if (!all_networks.empty()) {
                     gfx->setCursor(10, 70);
                     gfx->setTextColor(YELLOW, BLACK);
-                    gfx->print("Available Networks:");
                     
-                    // Display up to 6 strongest networks
-                    int display_count = min(6, (int)all_networks.size());
-                    for (int i = 0; i < display_count; i++) {
-                        gfx->setCursor(10, 90 + i * 18);
+                    int total_pages = (all_networks.size() + NETWORKS_PER_PAGE - 1) / NETWORKS_PER_PAGE;
+                    int current_page = (network_scroll_offset / NETWORKS_PER_PAGE) + 1;
+                    gfx->printf("Networks (Page %d/%d):", current_page, total_pages);
+                    
+                    // Display networks with scrolling
+                    int end_index = min(network_scroll_offset + NETWORKS_PER_PAGE, (int)all_networks.size());
+                    for (int i = network_scroll_offset; i < end_index; i++) {
+                        int display_row = i - network_scroll_offset;
+                        gfx->setCursor(10, 90 + display_row * 18);
                         gfx->setTextColor(WHITE, BLACK);
                         
                         // Calculate available width for SSID
@@ -509,6 +591,15 @@ void loop() {
                         
                         // Print network with right-aligned signal strength
                         gfx->printf("%-*s %ddBm", available_chars, display_ssid.c_str(), all_networks[i].rssi);
+                    }
+                    
+                    // Draw navigation buttons AFTER the network list
+                    if (total_pages > 1) {
+                        // Up button (moved up to top-right corner)
+                        drawButton(250, 25, 60, 25, "▲ Up", false);
+                        
+                        // Down button (moved up, tight below up button)  
+                        drawButton(250, 55, 60, 25, "▼ Down", false);
                     }
                 }
             }
@@ -612,36 +703,29 @@ void loop() {
                     shady_wifi_stats.hidden_networks,
                     shady_wifi_stats.open_networks);
                 
-                // Show threat details if suspicious networks found
-                if (shady_wifi_stats.suspicious_networks > 0) {
+                // Show threat details with scrollable list
+                if (shady_wifi_stats.suspicious_networks > 0 && !detected_shady_networks.empty()) {
                     gfx->setCursor(10, 70);
                     gfx->setTextColor(YELLOW, BLACK);
-                    gfx->printf("Threat Types Found:");
                     
-                    // Row 1 of threats - Hidden SSIDs and Open Networks
-                    gfx->setCursor(10, 90);
-                    gfx->setTextColor(RED, BLACK);
-                    if (shady_wifi_stats.hidden_networks > 0) {
-                        gfx->printf("• %d Hidden SSIDs  ", shady_wifi_stats.hidden_networks);
-                    }
-                    if (shady_wifi_stats.open_networks > 0) {
-                        gfx->printf("• %d Open Networks", shady_wifi_stats.open_networks);
-                    }
+                    // Page info for shady networks
+                    int total_pages = (detected_shady_networks.size() + SHADY_NETWORKS_PER_PAGE - 1) / SHADY_NETWORKS_PER_PAGE;
+                    int current_page = (shady_scroll_offset / SHADY_NETWORKS_PER_PAGE) + 1;
+                    gfx->printf("Threats (Page %d/%d):", current_page, total_pages);
                     
-                    // Show up to 6 strongest shady networks with signal strength
-                    int y_pos = 110;
-                    int networks_to_show = min(6, (int)detected_shady_networks.size());
+                    // Display scrollable shady networks
+                    int end_index = min(shady_scroll_offset + SHADY_NETWORKS_PER_PAGE, (int)detected_shady_networks.size());
+                    int y_pos = 90;
                     
-                    // Calculate available character width dynamically
-                    // Screen width: 320px, current font width ~6px per char
-                    int total_chars = 320 / 6;  // ~53 characters total width
-                    int rssi_space = 7;         // Space for "-67dBm" 
-                    int prefix_space = 2;       // Space for "• "
-                    int available_ssid_chars = total_chars - rssi_space - prefix_space - 2; // -2 for safety margin
-                    
-                    for (int i = 0; i < networks_to_show; i++) {
+                    for (int i = shady_scroll_offset; i < end_index; i++) {
                         gfx->setCursor(10, y_pos);
                         gfx->setTextColor(ORANGE, BLACK);
+                        
+                        // Calculate available character width dynamically
+                        int total_chars = 320 / 6;  // ~53 characters total width
+                        int rssi_space = 7;         // Space for "-67dBm" 
+                        int prefix_space = 2;       // Space for "• "
+                        int available_ssid_chars = total_chars - rssi_space - prefix_space - 2;
                         
                         String network_name = detected_shady_networks[i].ssid;
                         if (network_name.length() > available_ssid_chars) {
@@ -658,9 +742,15 @@ void loop() {
                         gfx->printf("-%ddBm", detected_shady_networks[i].rssi);
                         
                         y_pos += 20;
+                    }
+                    
+                    // Draw navigation buttons AFTER the threat list
+                    if (total_pages > 1) {
+                        // Up button (top-right corner)
+                        drawButton(250, 25, 60, 25, "▲ Up", false);
                         
-                        // Stop if we run out of screen space (before back button)
-                        if (y_pos > 180) break;
+                        // Down button (tight below up button)  
+                        drawButton(250, 55, 60, 25, "▼ Down", false);
                     }
                 }
                 
@@ -770,6 +860,21 @@ void loop() {
             // System Stats screen - static display
             break;
             
+        case COUNTERMEASURES:
+            if (isScanning) {
+                scan_for_portals();
+                send_counter_messages();
+                
+                // Update display with live stats
+                displayCountermeasures();
+                
+                // Flash blue LED when counter-attacking
+                if (counter_messages_sent > 0 && millis() % 1000 < 100) {
+                    flashLED(0, 0, 255, 50); // Blue flash
+                }
+            }
+            break;
+            
         case MATRIX_SCREENSAVER:
             updateMatrixScreensaver();
             break;
@@ -785,21 +890,35 @@ void loop() {
 void displayMainMenu() {
     gfx->fillScreen(BLACK);
     
-    // Title
-    gfx->setTextSize(2);
-    drawCenteredText("AntiPredCYD", 20, WHITE);
+    // Add subtle grid background
+    drawGridBackground();
     
-    // Menu items
+    // Title - NEON BRIGHT RETRO STYLE!
+    gfx->setTextSize(2);
+    drawCenteredText("PREDATOR DEFENSE", 12, RGB565(255, 0, 0));  // BRIGHT RED!
+    
+    // Add a bright accent line under title  
+    gfx->drawFastHLine(50, 32, 220, RGB565(255, 0, 255));  // Bright magenta line
+    
+    // Subtitle - BRIGHT GREEN like old terminal
+    gfx->setTextSize(1);
+    drawCenteredText(">> SECURITY DETECTION SYSTEM <<", 40, RGB565(0, 255, 0));  // Bright green
+    
+    // Menu items with enhanced spacing - TRIMMED BUTTONS!
     gfx->setTextSize(1);
     for (int i = 0; i < mainMenuCount; i++) {
-        int y = 60 + (i * MENU_ITEM_HEIGHT);
+        int y = 70 + (i * MENU_ITEM_HEIGHT);  // More space from header
         bool selected = (i == selectedMenuItem);
-        drawButton(20, y, 280, 25, mainMenuItems[i], selected);
+        // Centered, trimmed buttons: 220px wide, centered on 320px screen
+        drawButton(50, y, 220, 25, mainMenuItems[i], selected);
     }
 }
 
 void displayMoreOptionsMenu() {
     gfx->fillScreen(BLACK);
+    
+    // Add subtle grid background
+    drawGridBackground();
     
     // Title
     gfx->setTextSize(2);
@@ -810,7 +929,7 @@ void displayMoreOptionsMenu() {
     for (int i = 0; i < moreOptionsCount; i++) {
         int y = 60 + (i * MENU_ITEM_HEIGHT);
         bool selected = (i == selectedMoreOption);
-        drawButton(20, y, 280, 25, moreOptionsItems[i], selected);
+        drawButton(50, y, 220, 25, moreOptionsItems[i], selected);
     }
     
     // Back button
@@ -840,24 +959,35 @@ void displayStatusScreen(const char* title, const char* status) {
 void displayAboutInfo() {
     gfx->fillScreen(BLACK);
     
-    // Title
+    // Add subtle grid background
+    drawGridBackground();
+    
+    // Title - NEON BRIGHT matching main menu!
     gfx->setTextSize(2);
-    drawCenteredText("AntiPredCYD", 20, WHITE);
+    drawCenteredText("PREDATOR DEFENSE", 10, RGB565(255, 0, 0));  // BRIGHT RED!
     
-    // Version and info
+    // Add bright accent line
+    gfx->drawFastHLine(50, 28, 220, RGB565(255, 0, 255));  // Bright magenta line
+    
+    // Subtitle - BRIGHT GREEN
     gfx->setTextSize(1);
-    gfx->setCursor(10, 50);
-    gfx->setTextColor(GREEN);
-    gfx->println("Version: 1.2.5");
+    drawCenteredText(">> SECURITY DETECTION SYSTEM <<", 35, RGB565(0, 255, 0));  // Bright green
     
-    gfx->setCursor(10, 70);
-    gfx->setTextColor(WHITE);
+    // Version and info with NEON colors
+    gfx->setTextSize(1);
+    gfx->setCursor(10, 55);
+    gfx->setTextColor(RGB565(255, 255, 0));  // Bright yellow
+    gfx->println("Version: 1.3.0 NEON Enhanced");
+    
+    gfx->setCursor(10, 75);
+    gfx->setTextColor(RGB565(0, 255, 255));  // Bright cyan
     gfx->println("ESP32-2432S028 Security Suite");
     
-    gfx->setCursor(10, 90);
+    gfx->setCursor(10, 95);
+    gfx->setTextColor(RGB565(255, 128, 0));  // Bright orange
     gfx->println("Features:");
     gfx->setCursor(20, 110);
-    gfx->setTextColor(YELLOW);
+    gfx->setTextColor(RGB565(255, 0, 255));  // Bright magenta
     gfx->println("• Deauth Attack Detection");
     gfx->setCursor(20, 125);
     gfx->println("• Rogue AP/Evil Twin Scanner");
@@ -869,8 +999,8 @@ void displayAboutInfo() {
     gfx->println("• Credential Harvesting Alert");
     
     gfx->setCursor(10, 190);
-    gfx->setTextColor(GREEN);
-    gfx->println("Anti-Predator Defense System");
+    gfx->setTextColor(RGB565(0, 255, 0));  // Bright green
+    gfx->println(">>> ADVANCED THREAT DETECTION <<<");
     
     // Back button
     drawButton(20, 210, 100, 25, "< Back", false);
@@ -1039,7 +1169,7 @@ void exportLogsToSD() {
     
     // Footer
     logFile.println("\n=== END OF LOG ===");
-    logFile.printf("Log generated by AntiPred CYD v1.2.5\n");
+    logFile.printf("Log generated by AntiPred CYD v1.3.0\n");
     
     logFile.close();
     
@@ -1070,10 +1200,11 @@ void handleTouch() {
             flashLED(0, 255, 0, 100); // Green flash on touch
             
             if (currentMenu == MAIN_MENU) {
-                // Check which menu item was touched
+                // Check which menu item was touched - updated for new button positions
                 for (int i = 0; i < mainMenuCount; i++) {
-                    int itemY = 60 + (i * MENU_ITEM_HEIGHT);
-                    if (y >= itemY && y <= itemY + 25) {
+                    int itemY = 70 + (i * MENU_ITEM_HEIGHT);  // Match new Y position
+                    // New X range: buttons are now 50-270 (50 + 220 width)
+                    if (y >= itemY && y <= itemY + 25 && x >= 50 && x <= 270) {
                         selectedMenuItem = i;
                         
                         // Switch to selected module
@@ -1096,10 +1227,11 @@ void handleTouch() {
                     }
                 }
             } else if (currentMenu == MORE_OPTIONS) {
-                // Handle touches in MORE OPTIONS menu
+                // Handle touches in MORE OPTIONS menu - updated for new button positions
                 for (int i = 0; i < moreOptionsCount; i++) {
                     int itemY = 60 + (i * MENU_ITEM_HEIGHT);
-                    if (y >= itemY && y <= itemY + 25) {
+                    // New X range: buttons are now 50-270 (50 + 220 width)
+                    if (y >= itemY && y <= itemY + 25 && x >= 50 && x <= 270) {
                         selectedMoreOption = i;
                         
                         // Switch to selected option - MORE_OPTIONS removed
@@ -1115,7 +1247,11 @@ void handleTouch() {
                                 currentMenu = MATRIX_SCREENSAVER;
                                 initMatrixScreensaver();
                                 break;
-                            case 3: // About/Info
+                            case 3: // Countermeasures
+                                currentMenu = COUNTERMEASURES;
+                                displayStatusScreen("Countermeasures", "Ready");
+                                break;
+                            case 4: // About/Info
                                 currentMenu = ABOUT_INFO;
                                 displayAboutInfo();
                                 break;
@@ -1154,6 +1290,71 @@ void handleTouch() {
                 displayMoreOptionsMenu();
             } else {
                 // Handle touches in status screens
+                
+                // Handle Up/Down navigation buttons for Network Scanner
+                if (currentMenu == NETWORK_SCANNER && isScanning && !all_networks.empty()) {
+                    // Up button (250, 25, 60, 25)
+                    if (y >= 25 && y <= 50 && x >= 250 && x <= 310) {
+                        // Scroll up (decrease offset)
+                        if (network_scroll_offset > 0) {
+                            network_scroll_offset -= NETWORKS_PER_PAGE;
+                            if (network_scroll_offset < 0) {
+                                network_scroll_offset = 0;
+                            }
+                        }
+                        // Don't process other buttons when navigation is pressed
+                        lastTouchTime = millis();
+                        return;
+                    }
+                    
+                    // Down button (250, 55, 60, 25)
+                    if (y >= 55 && y <= 80 && x >= 250 && x <= 310) {
+                        // Scroll down (increase offset)
+                        int max_offset = ((int)all_networks.size() - 1) / NETWORKS_PER_PAGE * NETWORKS_PER_PAGE;
+                        if (network_scroll_offset < max_offset) {
+                            network_scroll_offset += NETWORKS_PER_PAGE;
+                            if (network_scroll_offset > max_offset) {
+                                network_scroll_offset = max_offset;
+                            }
+                        }
+                        // Don't process other buttons when navigation is pressed
+                        lastTouchTime = millis();
+                        return;
+                    }
+                }
+                
+                // Handle Up/Down navigation buttons for Shady WiFi Scanner
+                if (currentMenu == WIFI_SCANNER && isScanning && !detected_shady_networks.empty()) {
+                    // Up button (250, 25, 60, 25)
+                    if (y >= 25 && y <= 50 && x >= 250 && x <= 310) {
+                        // Scroll up (decrease offset)
+                        if (shady_scroll_offset > 0) {
+                            shady_scroll_offset -= SHADY_NETWORKS_PER_PAGE;
+                            if (shady_scroll_offset < 0) {
+                                shady_scroll_offset = 0;
+                            }
+                        }
+                        // Don't process other buttons when navigation is pressed
+                        lastTouchTime = millis();
+                        return;
+                    }
+                    
+                    // Down button (250, 55, 60, 25)
+                    if (y >= 55 && y <= 80 && x >= 250 && x <= 310) {
+                        // Scroll down (increase offset)
+                        int max_offset = ((int)detected_shady_networks.size() - 1) / SHADY_NETWORKS_PER_PAGE * SHADY_NETWORKS_PER_PAGE;
+                        if (shady_scroll_offset < max_offset) {
+                            shady_scroll_offset += SHADY_NETWORKS_PER_PAGE;
+                            if (shady_scroll_offset > max_offset) {
+                                shady_scroll_offset = max_offset;
+                            }
+                        }
+                        // Don't process other buttons when navigation is pressed
+                        lastTouchTime = millis();
+                        return;
+                    }
+                }
+                
                 if (y >= 200 && y <= 230) {
                     if (x >= 20 && x <= 120) {
                         // Back button
@@ -1173,6 +1374,9 @@ void handleTouch() {
                         if (shady_wifi_scanner_active) {
                             stop_shady_wifi_monitoring();
                         }
+                        if (countermeasures_active) {
+                            stop_countermeasures();
+                        }
                         
                         displayMainMenu();
                     } else if (x >= 200 && x <= 300) {
@@ -1190,9 +1394,11 @@ void handleTouch() {
                             }
                         } else if (currentMenu == NETWORK_SCANNER) {
                             if (isScanning) {
+                                network_scroll_offset = 0; // Reset scroll position
                                 start_pineap_monitoring();
                                 displayStatusScreen("All Available Networks", "Scanning...");
                             } else {
+                                network_scroll_offset = 0; // Reset scroll position
                                 stop_pineap_monitoring();
                                 displayStatusScreen("All Available Networks", "Stopped");
                             }
@@ -1206,9 +1412,11 @@ void handleTouch() {
                             }
                         } else if (currentMenu == WIFI_SCANNER) {
                             if (isScanning) {
+                                shady_scroll_offset = 0; // Reset scroll position
                                 start_shady_wifi_monitoring();
                                 displayStatusScreen("Shady WiFi Scanner", "Scanning...");
                             } else {
+                                shady_scroll_offset = 0; // Reset scroll position
                                 stop_shady_wifi_monitoring();
                                 displayStatusScreen("Shady WiFi Scanner", "Stopped");
                             }
@@ -1219,6 +1427,14 @@ void handleTouch() {
                             } else {
                                 stop_cred_harvest_monitoring();
                                 displayStatusScreen("Credential Alert", "Stopped");
+                            }
+                        } else if (currentMenu == COUNTERMEASURES) {
+                            if (isScanning) {
+                                start_countermeasures();
+                                displayStatusScreen("Countermeasures", "Active");
+                            } else {
+                                stop_countermeasures();
+                                displayStatusScreen("Countermeasures", "Stopped");
                             }
                         } else {
                             const char* status = isScanning ? "Scanning..." : "Ready";
@@ -1246,15 +1462,21 @@ void flashLED(uint8_t r, uint8_t g, uint8_t b, int duration) {
 }
 
 void drawButton(int x, int y, int w, int h, const char* text, bool selected) {
-    uint16_t bgColor = selected ? BLUE : DARKGREY;
-    uint16_t textColor = selected ? WHITE : LIGHTGREY;
+    // NEON BUTTON COLORS - bright and confident!
+    uint16_t bgColor = selected ? RGB565(255, 0, 128) : RGB565(40, 40, 80);  // Hot pink selection, dark blue background
+    uint16_t textColor = selected ? WHITE : RGB565(0, 255, 255);  // White selected, bright cyan unselected  
+    uint16_t borderColor = selected ? RGB565(255, 255, 0) : RGB565(0, 200, 255);  // Yellow border selected, bright blue unselected
     
     gfx->fillRect(x, y, w, h, bgColor);
-    gfx->drawRect(x, y, w, h, WHITE);
+    gfx->drawRect(x, y, w, h, borderColor);
     
-    // Center text in button
-    int textX = x + (w - strlen(text) * 6) / 2;
-    int textY = y + (h - 8) / 2;
+    // Make selected buttons slightly bigger/bolder
+    int textSize = selected ? 1 : 1;
+    gfx->setTextSize(textSize);
+    
+    int charWidth = 6 * textSize;
+    int textX = x + (w - strlen(text) * charWidth) / 2;
+    int textY = y + (h - 8 * textSize) / 2;
     
     gfx->setCursor(textX, textY);
     gfx->setTextColor(textColor);
@@ -1262,12 +1484,37 @@ void drawButton(int x, int y, int w, int h, const char* text, bool selected) {
 }
 
 void drawCenteredText(const char* text, int y, uint16_t color) {
-    int textWidth = strlen(text) * 6; // Default character width
+    // Get current text size to calculate proper centering
+    int textSize = 1; // Default size
+    int charWidth = 6 * textSize; 
+    
+    // For size 2 text, character width is doubled
+    if (y <= 15) { // Main titles are usually at top
+        textSize = 2;
+        charWidth = 12;
+    }
+    
+    int textWidth = strlen(text) * charWidth;
     int x = (SCREEN_WIDTH - textWidth) / 2;
     
     gfx->setCursor(x, y);
     gfx->setTextColor(color);
     gfx->print(text);
+}
+
+void drawGridBackground() {
+    // Subtle grid pattern - dark blue/purple lines
+    uint16_t gridColor = RGB565(20, 20, 60);  // Dark blue-purple, subtle but visible
+    
+    // Draw vertical lines every 30 pixels
+    for (int x = 30; x < SCREEN_WIDTH; x += 30) {
+        gfx->drawFastVLine(x, 0, SCREEN_HEIGHT, gridColor);
+    }
+    
+    // Draw horizontal lines every 25 pixels  
+    for (int y = 25; y < SCREEN_HEIGHT; y += 25) {
+        gfx->drawFastHLine(0, y, SCREEN_WIDTH, gridColor);
+    }
 }
 
 // Deauth Hunter Implementation
@@ -2199,4 +2446,340 @@ void updateMatrixScreensaver() {
     }
     
     last_matrix_update = millis();
+}
+
+// Attack functions for different portal types
+void attack_bruce_portal(const String& gateway) {
+    WiFiClient client;
+    
+    // Bruce-style endpoints (192.168.4.1 portals)
+    String bruce_endpoints[] = {"/login", "/auth", "/signin", "/portal", "/admin", "/index", "/", "/captive"};
+    int num_bruce_endpoints = 8;
+    
+    for (int attack = 0; attack < 3; attack++) { // 3 attack rounds
+        for (int e = 0; e < num_bruce_endpoints; e++) {
+            String endpoint = bruce_endpoints[e];
+            
+            Serial.printf("💥 Bruce attack %d: POST %s%s\n", attack + 1, gateway.c_str(), endpoint.c_str());
+            
+            if (client.connect(gateway.c_str(), 80)) {
+                // Try multiple credential formats for Bruce
+                String formats[] = {
+                    "username=Caught%20Ya%20Slippin&password=Ya%20Damn%20Fool",
+                    "user=Caught%20Ya%20Slippin&pass=Ya%20Damn%20Fool",
+                    "email=Caught%20Ya%20Slippin&password=Ya%20Damn%20Fool"
+                };
+                
+                String postData = formats[attack % 3]; // Rotate through formats
+                
+                client.print("POST " + endpoint + " HTTP/1.1\r\n");
+                client.print("Host: " + gateway + "\r\n");
+                client.print("Content-Type: application/x-www-form-urlencoded\r\n");
+                client.print("Content-Length: " + String(postData.length()) + "\r\n");
+                client.print("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n");
+                client.print("Accept: text/html,application/xhtml+xml,application/xml\r\n");
+                client.print("Referer: http://" + gateway + endpoint + "\r\n");
+                client.print("Connection: close\r\n\r\n");
+                client.print(postData);
+                
+                // Brief wait for response
+                delay(150);
+                client.stop();
+                
+                Serial.println("   ✅ Bruce attack sent");
+            } else {
+                Serial.println("   ❌ Connection failed");
+            }
+            
+            delay(100); // Brief delay between endpoints
+        }
+    }
+    
+    Serial.printf("🔥 Bruce portal attack complete: %d attacks sent to %s\n", 3 * num_bruce_endpoints, gateway.c_str());
+}
+
+void attack_nemo_portal(const String& gateway) {
+    WiFiClient client;
+    
+    // Nemo-style attack (172.0.0.1 portals) - targets /post with email/password
+    for (int attack = 0; attack < 10; attack++) { // 10 attack rounds for Nemo
+        Serial.printf("💥 Nemo attack %d: POST %s/post with email/password params\n", attack + 1, gateway.c_str());
+        
+        if (client.connect(gateway.c_str(), 80)) {
+            // Use both formats to ensure compatibility
+            String postData1 = "email=Caught%20Ya%20Slippin&password=Ya%20Damn%20Fool";
+            String postData2 = "username=Caught%20Ya%20Slippin&password=Ya%20Damn%20Fool";
+            
+            // Send first attack with email/password (Nemo standard)
+            client.print("POST /post HTTP/1.1\r\n");
+            client.print("Host: " + gateway + "\r\n");
+            client.print("Content-Type: application/x-www-form-urlencoded\r\n");
+            client.print("Content-Length: " + String(postData1.length()) + "\r\n");
+            client.print("User-Agent: Mozilla/5.0\r\n");
+            client.print("Accept: text/html,application/xhtml+xml\r\n");
+            client.print("Connection: close\r\n\r\n");
+            client.print(postData1);
+            
+            delay(100);
+            client.stop();
+            
+            // Send second attack with username/password (backup)
+            if (client.connect(gateway.c_str(), 80)) {
+                client.print("POST /post HTTP/1.1\r\n");
+                client.print("Host: " + gateway + "\r\n");
+                client.print("Content-Type: application/x-www-form-urlencoded\r\n");
+                client.print("Content-Length: " + String(postData2.length()) + "\r\n");
+                client.print("User-Agent: Mozilla/5.0\r\n");
+                client.print("Accept: text/html,application/xhtml+xml\r\n");
+                client.print("Connection: close\r\n\r\n");
+                client.print(postData2);
+                
+                delay(100);
+                client.stop();
+            }
+            
+            Serial.println("   ✅ Dual Nemo attacks sent (email + username variants)");
+        } else {
+            Serial.println("   ❌ Connection failed");
+        }
+        
+        delay(500); // Longer delay for Nemo attacks to avoid overwhelming
+    }
+    
+    Serial.printf("🔥 Nemo portal attack complete: 20 attacks sent to %s/post\n", gateway.c_str());
+}
+
+// Portal Killer (Countermeasures) Implementation
+void start_countermeasures() {
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
+    
+    // Initialize stats
+    portals_found = 0;
+    counter_messages_sent = 0;
+    last_portal_scan = 0;
+    last_counter_message = 0;
+    detected_portals.clear();
+    
+    countermeasures_active = true;
+    Serial.println("Countermeasures activated - hunting portals and sending counter-messages");
+}
+
+void stop_countermeasures() {
+    countermeasures_active = false;
+    WiFi.mode(WIFI_STA);
+    detected_portals.clear();
+    Serial.println("Countermeasures deactivated");
+}
+
+void scan_for_portals() {
+    uint32_t now = millis();
+    
+    if (now - last_portal_scan > PORTAL_SCAN_INTERVAL) {
+        Serial.println("🔍 Scanning for BOTH Bruce (192.168.4.1) and Nemo (172.0.0.1) portals...");
+        
+        int n = WiFi.scanNetworks();
+        if (n > 0) {
+            for (int i = 0; i < n; i++) {
+                String ssid = WiFi.SSID(i);
+                String bssid = WiFi.BSSIDstr(i);
+                int32_t rssi = WiFi.RSSI(i);
+                uint8_t channel = WiFi.channel(i);
+                wifi_auth_mode_t encType = WiFi.encryptionType(i);
+                
+                Serial.printf("🔍 Network %d: '%s' [%s] Ch:%d RSSI:%d %s\n", 
+                             i+1, ssid.c_str(), bssid.c_str(), channel, rssi,
+                             (encType == WIFI_AUTH_OPEN) ? "OPEN" : "ENCRYPTED");
+                
+                // TARGET ALL OPEN NETWORKS (like EvilBotDef1 aggressive mode)
+                if (encType == WIFI_AUTH_OPEN) {
+                    // Skip our own networks and known safe ones
+                    if (ssid.indexOf("AntiPred") != -1 || ssid.indexOf("defender") != -1) {
+                        Serial.println("   SKIPPED (our network)");
+                        continue;
+                    }
+                    
+                    // Check if this portal is already detected
+                    bool found = false;
+                    for (auto& portal : detected_portals) {
+                        if (portal.bssid == bssid) {
+                            portal.last_seen = now;
+                            portal.rssi = rssi;
+                            found = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!found) {
+                        PortalInfo portal(ssid, bssid, rssi, channel);
+                        portal.is_portal = true;
+                        detected_portals.push_back(portal);
+                        portals_found++;
+                        
+                        Serial.printf("🎯 OPEN NETWORK DETECTED: '%s' (%s) Ch:%d - TARGETING!\n", 
+                                    ssid.c_str(), bssid.c_str(), channel);
+                        
+                        // Log the portal detection
+                        logThreat("Portal_Detected", ssid + " (" + bssid + ")", rssi, channel);
+                    }
+                } else {
+                    Serial.println("   ENCRYPTED - Safe");
+                }
+            }
+        } else {
+            Serial.println("❌ No networks found");
+        }
+        
+        WiFi.scanDelete();
+        last_portal_scan = now;
+    }
+}
+
+void send_counter_messages() {
+    uint32_t now = millis();
+    
+    if (now - last_counter_message > COUNTER_MESSAGE_INTERVAL && !detected_portals.empty()) {
+        Serial.println("💥 COUNTER-ATTACKING DETECTED PORTALS!");
+        
+        // Attack each detected portal with both Bruce and Nemo methods
+        for (const auto& portal : detected_portals) {
+            Serial.printf("🎯 Attacking portal: '%s' at %s\n", portal.ssid.c_str(), portal.bssid.c_str());
+            
+            // Connect to the portal to get gateway IP (like EvilBotDef1)
+            WiFi.disconnect();
+            delay(500);
+            
+            Serial.printf("🔄 Connecting to '%s'...\n", portal.ssid.c_str());
+            WiFi.begin(portal.ssid.c_str(), "");
+            
+            int attempts = 0;
+            while (WiFi.status() != WL_CONNECTED && attempts < 15) {
+                delay(1000);
+                attempts++;
+                Serial.printf("   Connection attempt %d/15\n", attempts);
+            }
+            
+            if (WiFi.status() == WL_CONNECTED) {
+                String gateway = WiFi.gatewayIP().toString();
+                Serial.printf("✅ Connected! Gateway IP: %s\n", gateway.c_str());
+                
+                // Attack with BOTH methods based on gateway IP
+                if (gateway.startsWith("192.168.4.")) {
+                    Serial.println("🎯 Bruce-style portal detected (192.168.4.x) - attacking common endpoints");
+                    attack_bruce_portal(gateway);
+                } else if (gateway.startsWith("172.0.0.")) {
+                    Serial.println("🎯 Nemo-style portal detected (172.0.0.x) - attacking /post endpoint");
+                    attack_nemo_portal(gateway);
+                } else {
+                    Serial.printf("🎯 Unknown portal type (%s) - attacking with BOTH methods\n", gateway.c_str());
+                    attack_bruce_portal(gateway);
+                    attack_nemo_portal(gateway);
+                }
+                
+                counter_messages_sent += 10; // Count all attack attempts
+                
+            } else {
+                Serial.printf("❌ Failed to connect to '%s'\n", portal.ssid.c_str());
+            }
+        }
+        
+        last_counter_message = now;
+    }
+}
+
+bool is_portal_network(const String& ssid) {
+    if (ssid.length() == 0) return false;
+    
+    String upperSSID = ssid;
+    upperSSID.toUpperCase();
+    
+    for (int i = 0; i < portal_patterns_count; i++) {
+        String pattern = String(portal_patterns[i]);
+        pattern.toUpperCase();
+        
+        if (upperSSID.indexOf(pattern) != -1) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+void send_counter_beacon(const String& ssid, uint8_t channel) {
+    // Set WiFi channel
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    
+    // Create beacon packet
+    uint8_t beacon[128];
+    memcpy(beacon, counter_beacon_packet, sizeof(counter_beacon_packet));
+    
+    // Generate random MAC addresses
+    for (int i = 10; i < 16; i++) {
+        beacon[i] = random(256);        // Source MAC
+        beacon[i + 6] = beacon[i];      // Copy to BSSID
+    }
+    
+    // Make MAC locally administered
+    beacon[10] = (beacon[10] & 0xFC) | 0x02;
+    beacon[16] = (beacon[16] & 0xFC) | 0x02;
+    
+    // Set SSID
+    int ssidLen = min(32, (int)ssid.length());
+    beacon[37] = (uint8_t)ssidLen;
+    
+    // Clear SSID area and set new SSID
+    memset(&beacon[38], 0x20, 32);
+    for (int i = 0; i < ssidLen; i++) {
+        beacon[38 + i] = ssid.c_str()[i];
+    }
+    
+    // Update timestamp
+    uint64_t timestamp = micros();
+    memcpy(&beacon[24], &timestamp, 8);
+    
+    // Update channel parameter
+    beacon[sizeof(counter_beacon_packet) - 1] = channel;
+    
+    // Send beacon multiple times for better visibility
+    for (int i = 0; i < 3; i++) {
+        esp_wifi_80211_tx(WIFI_IF_STA, beacon, sizeof(counter_beacon_packet), false);
+        delayMicroseconds(1000);
+    }
+}
+
+void displayCountermeasures() {
+    // Update live display with current stats
+    gfx->setTextSize(1);
+    gfx->setCursor(20, 120);
+    gfx->setTextColor(WHITE, BLACK);
+    gfx->printf("Open APs Found: %-3d      ", portals_found);
+    
+    gfx->setCursor(20, 140);
+    gfx->printf("Attacks Sent: %-5d      ", counter_messages_sent);
+    
+    gfx->setCursor(20, 160);
+    gfx->printf("Active Targets: %-2d       ", detected_portals.size());
+    
+    // Show detected portals with their likely type
+    if (!detected_portals.empty()) {
+        gfx->setCursor(20, 180);
+        gfx->setTextColor(RED, BLACK);
+        
+        // Show up to 2 most recent portals
+        int displayed = 0;
+        for (int i = detected_portals.size() - 1; i >= 0 && displayed < 2; i--) {
+            const auto& portal = detected_portals[i];
+            
+            // Truncate SSID if too long
+            String displaySSID = portal.ssid;
+            if (displaySSID.length() > 15) {
+                displaySSID = displaySSID.substring(0, 12) + "...";
+            }
+            
+            gfx->setCursor(20, 180 + displayed * 15);
+            gfx->printf("• %s [ATTACKING]", displaySSID.c_str());
+            displayed++;
+        }
+    }
 }
