@@ -160,9 +160,37 @@ pio device monitor
 - `board_build.f_cpu = 240000000L` — full 240MHz for responsive UI
 - BLE enabled via `-DCONFIG_BT_ENABLED=1 -DCONFIG_BLUEDROID_ENABLED=1`
 
+## Known Issues & Notes
+
+### ⚠️ First Boot: Switch Away from SCAN Before Using It
+On first flash or cold boot, **tap any other mode first** (e.g. PROBE, CHAN) and then return to SCAN. Going straight into SCAN immediately after boot can cause a crash/reboot. This is a known quirk of the WiFi stack initialization timing — harmless, and a fix may come in a future update.
+
 ---
 
-## Project History
+## Inverted Display Version (`InvertedCYDWifiScanner/`)
+
+An identical copy of this project exists in `InvertedCYDWifiScanner/` for CYD boards that ship with the ILI9341 display wired with inverted color polarity. The **only difference** is one line added to setup:
+
+```cpp
+gfx->invertDisplay(true);
+```
+
+This corrects the hardware-level color inversion at the display controller. **Expect the colors to look different from the original** — the green-on-black theme will shift to different hues depending on the specific panel. This is normal for inverted conversions; the UI layout and all functionality remain identical.
+
+---
+
+## External IPEX Antenna Mod (CYD)
+
+This CYD board ships with the RF path set to the onboard PCB antenna.  
+To use the IPEX (u.FL) connector, **move the 0Ω RF selector resistor** from the PCB-antenna pad to the IPEX pad, which switches the antenna path to the external connector.
+
+> ⚠️ Only one antenna path should be connected at a time — do not bridge both pads.
+
+An external antenna improves WiFi and BLE scan range significantly, which directly benefits all modes in this scanner.
+
+---
+
+
 
 This project is a fusion of two prior builds:
 
