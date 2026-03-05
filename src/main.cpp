@@ -78,7 +78,7 @@ static void sdLog(const char* tag, const char* msg) {
 #define BODY_Y      HEADER_H
 #define BODY_H      192
 #define FOOTER_Y    212
-#define NUM_MODES     6
+#define NUM_MODES     7
 
 // ─── Colors ─────────────────────────────────────────────────────────────────
 #define COL_BG        0x0000
@@ -101,7 +101,8 @@ static void sdLog(const char* tag, const char* msg) {
 #define MODE_DEAUTH  3
 #define MODE_BLE     4
 #define MODE_SHADY   5
-static const char* MODE_NAMES[NUM_MODES] = {"SCAN","PROBE","CHAN","DAUTH","BLE","SHADY"};
+#define MODE_HASH    6
+static const char* MODE_NAMES[NUM_MODES] = {"SCAN","PROBE","CHAN","DAUTH","BLE","SHADY","HASH"};
 
 // ─── App state ───────────────────────────────────────────────────────────────
 static int  sc_mode   = -1;
@@ -361,6 +362,104 @@ static const char* shadySuspicionReason(const char* ssid, int rssi, wifi_auth_mo
   return nullptr;
 }
 
+// ─── HASH state (WPA2 handshake / EAPOL capture) ─────────────────────────────
+#define HASH_AP_MAX      80    // known APs tracked from beacons
+#define HASH_CAP_MAX     20    // captured handshakes (for SD logging)
+#define HASH_HOP_MS     500UL  // channel-hop interval
+#define HASH_PKT_QUEUE    8    // in-RAM PCAP packet queue (ISR→main loop SD writes)
+#define HASH_PKT_MAXLEN 296    // max raw 802.11 frame size to capture
+#define HASH_HIST_W     280    // history ring-buffer width (pixels / seconds)
+
+struct HashAP      { uint8_t mac[6]; char ssid[33]; uint8_t ssid_len; };
+struct HashCapture { char ssid[33]; char bssid[18]; unsigned long ts; };
+struct PcapPkt     { uint8_t data[HASH_PKT_MAXLEN]; uint16_t len; unsigned long ts; };
+
+static HashAP      hashAPs[HASH_AP_MAX];
+static int         hashAPCount      = 0;
+static HashCapture hashCaptures[HASH_CAP_MAX];
+static int         hashCaptureHead  = 0;
+static int         hashCaptureCount = 0;
+static int         hashEapolTotal   = 0;
+static int         hashDeauthCount  = 0;
+static portMUX_TYPE hashMux         = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool hashUpdated    = false;
+static uint8_t     sc_hashChan      = 1;
+static unsigned long sc_hashLastHop  = 0;
+static unsigned long sc_hashLastDraw = 0;
+
+// Lock-free single-producer (ISR) / single-consumer (loop) PCAP packet queue
+static PcapPkt      hashPktQueue[HASH_PKT_QUEUE];
+static volatile int hashPktHead = 0;
+static volatile int hashPktTail = 0;
+static File         hashPcapFile;
+static bool         hashPcapOpen = false;
+
+// Per-second stats fed by ISR, consumed by loop every second
+static volatile uint32_t hashTmpPktCount = 0; // all frames this second
+static volatile int32_t  hashRssiSum     = 0; // RSSI sum for averaging
+static volatile uint32_t hashEapolSec    = 0; // EAPOL this second
+static volatile uint32_t hashDeauthSec   = 0; // deauth this second
+
+// Scrolling history ring-buffers (written from loop, read in renderHash)
+static uint32_t hashPktsBuf[HASH_HIST_W];    // packets per second
+static int8_t   hashRssiBuf[HASH_HIST_W];    // average RSSI per second
+static uint8_t  hashEapolBuf[HASH_HIST_W];   // EAPOL per second (capped 60)
+static uint8_t  hashDeauthBuf[HASH_HIST_W];  // deauth per second (capped 60)
+static int      hashHistHead = 0;             // next write position
+static bool     hashHistFull = false;
+
+// Last-seen info updated by ISR
+static char hashLastSSID[33]      = "[none]";
+static char hashLastSSIDMac[18]   = {0};
+static int8_t hashLastRSSI        = 0;
+static char hashLastEapolSSID[33] = "[none]";
+static char hashLastEapolMac[18]  = {0};
+static uint8_t hashOldChan        = 0; // track channel changes for graph annotation
+
+// ─── PCAP helpers ─────────────────────────────────────────────────────────────
+static bool hashOpenPcap() {
+  if (!sdOK) return false;
+  char fname[32];
+  snprintf(fname, sizeof(fname), "/hash%lu.pcap", millis());
+  hashPcapFile = SD.open(fname, FILE_WRITE);
+  if (!hashPcapFile) return false;
+  // PCAP global header (little-endian, 802.11 link type = 105)
+  uint8_t hdr[24] = {};
+  uint32_t magic = 0xa1b2c3d4; uint16_t vmaj = 2, vmin = 4;
+  int32_t zone = 0; uint32_t sig = 0, snap = 2500, net = 105;
+  memcpy(hdr+ 0, &magic, 4); memcpy(hdr+ 4, &vmaj,  2);
+  memcpy(hdr+ 6, &vmin,  2); memcpy(hdr+ 8, &zone,  4);
+  memcpy(hdr+12, &sig,   4); memcpy(hdr+16, &snap,  4);
+  memcpy(hdr+20, &net,   4);
+  hashPcapFile.write(hdr, 24);
+  hashPcapFile.flush();
+  Serial.printf("[HASH] PCAP open: %s\n", fname);
+  return true;
+}
+
+static void hashClosePcap() {
+  if (hashPcapOpen) { hashPcapFile.close(); hashPcapOpen = false; }
+}
+
+// Call from main loop to drain packet queue → SD card
+static void hashFlushQueue() {
+  while (hashPktTail != hashPktHead) {
+    int idx = hashPktTail;
+    if (hashPcapOpen) {
+      uint8_t phdr[16];
+      uint32_t ts_sec  = hashPktQueue[idx].ts / 1000;
+      uint32_t ts_usec = (hashPktQueue[idx].ts % 1000) * 1000;
+      uint32_t incl = hashPktQueue[idx].len, orig = hashPktQueue[idx].len;
+      memcpy(phdr+ 0, &ts_sec,  4); memcpy(phdr+ 4, &ts_usec, 4);
+      memcpy(phdr+ 8, &incl,    4); memcpy(phdr+12, &orig,    4);
+      hashPcapFile.write(phdr, 16);
+      hashPcapFile.write(hashPktQueue[idx].data, hashPktQueue[idx].len);
+      hashPcapFile.flush();
+    }
+    hashPktTail = (hashPktTail + 1) % HASH_PKT_QUEUE;
+  }
+}
+
 // ─── Promiscuous callback ─────────────────────────────────────────────────────
 static void IRAM_ATTR onPromisc(void* buf, wifi_promiscuous_pkt_type_t ptype) {
   if (sc_mode == MODE_CHANNEL) {
@@ -370,6 +469,96 @@ static void IRAM_ATTR onPromisc(void* buf, wifi_promiscuous_pkt_type_t ptype) {
     }
     return;
   }
+
+  if (sc_mode == MODE_HASH) {
+    const wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+    const uint8_t* f = pkt->payload;
+    uint32_t sig_len = pkt->rx_ctrl.sig_len;
+    if (ptype == WIFI_PKT_MGMT && sig_len >= 4) sig_len -= 4; // strip FCS
+    if (sig_len < 12 || sig_len > HASH_PKT_MAXLEN) return;
+
+    // Count every packet + RSSI for per-second stats
+    hashTmpPktCount++;
+    hashRssiSum += pkt->rx_ctrl.rssi;
+
+    uint8_t ftype    = (f[0] >> 2) & 0x3;
+    uint8_t fsubtype = (f[0] >> 4) & 0xF;
+
+    // Beacon (type=0, subtype=8): track AP MAC → SSID + update last-seen info
+    if (ftype == 0 && fsubtype == 8 && sig_len >= 42) {
+      uint8_t ssid_len = f[37];
+      if (ssid_len > 0 && ssid_len <= 32 && (uint32_t)(38 + ssid_len) <= sig_len) {
+        const uint8_t* ap_mac = &f[16];
+        portENTER_CRITICAL_ISR(&hashMux);
+        // Store last-seen beacon info for footer display
+        memcpy(hashLastSSID, &f[38], ssid_len); hashLastSSID[ssid_len] = '\0';
+        snprintf(hashLastSSIDMac, 18, "%02x:%02x:%02x:%02x:%02x:%02x",
+                 ap_mac[0],ap_mac[1],ap_mac[2],ap_mac[3],ap_mac[4],ap_mac[5]);
+        hashLastRSSI = (int8_t)pkt->rx_ctrl.rssi;
+        // Add to AP table if new
+        bool known = false;
+        for (int i = 0; i < hashAPCount; i++) {
+          if (memcmp(hashAPs[i].mac, ap_mac, 6) == 0) { known = true; break; }
+        }
+        if (!known && hashAPCount < HASH_AP_MAX) {
+          memcpy(hashAPs[hashAPCount].mac, ap_mac, 6);
+          memcpy(hashAPs[hashAPCount].ssid, &f[38], ssid_len);
+          hashAPs[hashAPCount].ssid[ssid_len] = '\0';
+          hashAPs[hashAPCount].ssid_len = ssid_len;
+          hashAPCount++;
+        }
+        portEXIT_CRITICAL_ISR(&hashMux);
+      }
+    }
+
+    // EAPOL: EtherType 0x888E at offset 30-31 or 32-33
+    if (sig_len >= 34 &&
+        ((f[30] == 0x88 && f[31] == 0x8E) || (f[32] == 0x88 && f[33] == 0x8E))) {
+      const uint8_t* src_mac = &f[16];
+      portENTER_CRITICAL_ISR(&hashMux);
+      hashEapolTotal++;
+      hashEapolSec++;
+      // Resolve SSID from AP table
+      char ssid_buf[33] = "???";
+      for (int i = 0; i < hashAPCount; i++) {
+        if (memcmp(hashAPs[i].mac, src_mac, 6) == 0) {
+          memcpy(ssid_buf, hashAPs[i].ssid, hashAPs[i].ssid_len + 1); break;
+        }
+      }
+      // Update last EAPOL display strings
+      strncpy(hashLastEapolSSID, ssid_buf, 32); hashLastEapolSSID[32] = '\0';
+      snprintf(hashLastEapolMac, 18, "%02x:%02x:%02x:%02x:%02x:%02x",
+               src_mac[0],src_mac[1],src_mac[2],src_mac[3],src_mac[4],src_mac[5]);
+      // Circular capture log (for SD)
+      HashCapture& cap = hashCaptures[hashCaptureHead];
+      strncpy(cap.ssid, ssid_buf, 32); cap.ssid[32] = '\0';
+      snprintf(cap.bssid, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
+               src_mac[0],src_mac[1],src_mac[2],src_mac[3],src_mac[4],src_mac[5]);
+      cap.ts = millis();
+      hashCaptureHead = (hashCaptureHead + 1) % HASH_CAP_MAX;
+      if (hashCaptureCount < HASH_CAP_MAX) hashCaptureCount++;
+      // Queue PCAP write
+      int next = (hashPktHead + 1) % HASH_PKT_QUEUE;
+      if (next != hashPktTail) {
+        PcapPkt& q = hashPktQueue[hashPktHead];
+        q.len = (uint16_t)sig_len; memcpy(q.data, f, sig_len); q.ts = millis();
+        hashPktHead = next;
+      }
+      hashUpdated = true;
+      portEXIT_CRITICAL_ISR(&hashMux);
+      ledFlash(false, true, false, 20);
+    }
+
+    // Deauth / disassoc
+    if (ptype == WIFI_PKT_MGMT && (f[0] == 0xA0 || f[0] == 0xC0)) {
+      portENTER_CRITICAL_ISR(&hashMux);
+      hashDeauthCount++;
+      hashDeauthSec++;
+      portEXIT_CRITICAL_ISR(&hashMux);
+    }
+    return;
+  }
+
   if (ptype != WIFI_PKT_MGMT) return;
   const wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
   const uint8_t* f = pkt->payload;
@@ -437,6 +626,9 @@ static void enterMode(int m) {
     WiFi.scanDelete(); sc_scanRunning = false; sc_shadyRunning = false;
   } else if (sc_mode == MODE_BLE) {
     bleScanActive = false; delay(200);
+  } else if (sc_mode == MODE_HASH) {
+    esp_wifi_set_promiscuous(false);
+    hashClosePcap();
   } else if (sc_mode >= 0) {
     esp_wifi_set_promiscuous(false);
   }
@@ -471,6 +663,28 @@ static void enterMode(int m) {
     case MODE_SHADY:
       shadyNetCount=0; shadyTotalNets=0; sc_shadyScroll=0; sc_shadyLast=0; sc_shadyRunning=false;
       pineapCount=0;
+      break;
+    case MODE_HASH:
+      portENTER_CRITICAL(&hashMux);
+      hashAPCount=0; hashCaptureHead=0; hashCaptureCount=0;
+      hashEapolTotal=0; hashDeauthCount=0;
+      hashTmpPktCount=0; hashRssiSum=0; hashEapolSec=0; hashDeauthSec=0;
+      hashPktHead=0; hashPktTail=0;
+      hashUpdated=false;
+      memset(hashPktsBuf,  0, sizeof(hashPktsBuf));
+      memset(hashRssiBuf,  0, sizeof(hashRssiBuf));
+      memset(hashEapolBuf, 0, sizeof(hashEapolBuf));
+      memset(hashDeauthBuf,0, sizeof(hashDeauthBuf));
+      hashHistHead=0; hashHistFull=false;
+      hashOldChan=0;
+      strcpy(hashLastSSID,"[none]");      hashLastSSIDMac[0]='\0';
+      strcpy(hashLastEapolSSID,"[none]"); hashLastEapolMac[0]='\0';
+      hashLastRSSI=0;
+      portEXIT_CRITICAL(&hashMux);
+      sc_hashChan=1; sc_hashLastHop=0; sc_hashLastDraw=0;
+      esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+      enablePromisc(true);
+      hashPcapOpen = hashOpenPcap();
       break;
   }
 }
@@ -744,6 +958,154 @@ static void renderShady() {
   if (sc_shadyScroll+SHADY_VISIBLE<shadyNetCount){ gfx->setTextColor(COL_DIM); gfx->setCursor(SCREEN_W-10,BODY_Y+BODY_H-12); gfx->print("v"); }
 }
 
+// ─── HASH renderer ───────────────────────────────────────────────────────────
+// Faithfully ports Hash Monster display layout (minus the monster sprite):
+//
+//  y=20-115  [units|  packets/sec bar chart (green), 95px tall        ]
+//  y=117-197 [         RSSI(yellow)/EAPOL(green)/deauth(red) dot graph  |units2]
+//  y=198-212 [footer: last SSID + rssi + mac  |  last EAPOL SSID + mac  ]
+//
+// Layout constants (mirrored from Hash Monster geometry, adapted to CYD body):
+#define H_UNITS1_W   36   // left units strip for bar chart
+#define H_BAR_X      36   // bar chart start x
+#define H_BAR_W     284   // bar chart width  (H_BAR_X .. 319)
+#define H_BAR_Y      20   // bar chart top y  (= BODY_Y)
+#define H_BAR_H      95   // bar chart height
+#define H_DOT_Y     117   // dot chart top y
+#define H_DOT_H      80   // dot chart height
+#define H_UNITS2_W   40   // right units strip for dot chart
+#define H_DOT_W     280   // dot chart width  (0 .. H_DOT_W-1)
+#define H_FOOT_Y    198   // status footer y  (within body)
+#define H_FOOT_H     14   // status footer height
+
+static void renderHash() {
+  gfx->fillRect(0, BODY_Y, SCREEN_W, BODY_H, COL_BG);
+
+  // ── Header ──────────────────────────────────────────────────────────────────
+  char hdr[56];
+  snprintf(hdr, sizeof(hdr), "CH:%02d AP:%d Pk:%lu E/D:%d/%d SD:%s",
+           sc_hashChan, hashAPCount, (unsigned long)hashPktsBuf[(hashHistHead+HASH_HIST_W-1)%HASH_HIST_W],
+           hashEapolTotal, hashDeauthCount, hashPcapOpen ? "On" : "Off");
+  drawHeader(hdr);
+
+  // ── Bar chart: packets/sec (graph1 equivalent) ───────────────────────────────
+  // Find max value over the history window for scaling
+  uint32_t maxPkt = 1;
+  int histLen = hashHistFull ? HASH_HIST_W : hashHistHead;
+  for (int i = 0; i < histLen; i++) { if (hashPktsBuf[i] > maxPkt) maxPkt = hashPktsBuf[i]; }
+
+  // Round max up to nearest 10 for cleaner scale
+  uint32_t scaledMax = ((maxPkt / 10) + 1) * 10;
+  float mult = (float)H_BAR_H / (float)scaledMax;
+
+  // Units strip (scale labels, right-aligned in 36px column)
+  gfx->setTextSize(1); gfx->setTextColor(COL_DIM);
+  for (int s = 0; s <= 4; s++) {
+    int val = (scaledMax * s) / 4;
+    int y   = H_BAR_Y + H_BAR_H - (int)(val * mult) - 6;
+    char buf[8]; snprintf(buf, sizeof(buf), "%4d", val);
+    gfx->setCursor(0, y); gfx->print(buf);
+  }
+
+  // Draw bars oldest→newest left→right
+  for (int col = 0; col < H_BAR_W; col++) {
+    int histIdx;
+    if (hashHistFull) {
+      histIdx = (hashHistHead + col - H_BAR_W + HASH_HIST_W) % HASH_HIST_W;
+    } else {
+      int offset = col - (H_BAR_W - hashHistHead);
+      if (offset < 0) { continue; } // no data yet for this column
+      histIdx = offset;
+    }
+    int barH = (int)(hashPktsBuf[histIdx] * mult);
+    barH = constrain(barH, 0, H_BAR_H);
+    int bx = H_BAR_X + col;
+    // Erase column
+    gfx->drawFastVLine(bx, H_BAR_Y, H_BAR_H, COL_BG);
+    // Draw bar (green)
+    if (barH > 0) gfx->drawFastVLine(bx, H_BAR_Y + H_BAR_H - barH, barH, COL_GREEN);
+  }
+  gfx->drawFastHLine(0, H_BAR_Y + H_BAR_H, SCREEN_W, COL_DIVIDER);
+
+  // ── Dot chart: RSSI / EAPOL / deauth (graph2 equivalent) ────────────────────
+  gfx->fillRect(0, H_DOT_Y, H_DOT_W, H_DOT_H, COL_BG);
+
+  for (int col = 0; col < H_DOT_W; col++) {
+    int histIdx;
+    if (hashHistFull) {
+      histIdx = (hashHistHead + col - H_DOT_W + HASH_HIST_W) % HASH_HIST_W;
+    } else {
+      int offset = col - (H_DOT_W - hashHistHead);
+      if (offset < 0) { continue; }
+      histIdx = offset;
+    }
+    int cx = col;
+
+    // Vertical grid every 10 pixels (navy/dim)
+    if ((H_DOT_W - 1 - col) % 10 == 0) {
+      gfx->drawFastVLine(cx, H_DOT_Y, H_DOT_H, 0x000F); // dim navy
+    }
+
+    // RSSI dot (yellow): map -100..-30 → top..bottom of H_DOT_H
+    int8_t rssi = hashRssiBuf[histIdx];
+    if (rssi < 0) {
+      int ry = constrain((-rssi - 30) * H_DOT_H / 70, 0, H_DOT_H - 2);
+      gfx->drawPixel(cx, H_DOT_Y + ry, COL_YELLOW);
+      gfx->drawPixel(cx, H_DOT_Y + ry + 1, COL_YELLOW);
+    }
+
+    // EAPOL dot (green): from bottom
+    uint8_t ep = hashEapolBuf[histIdx];
+    if (ep > 0) {
+      int ey = constrain((int)ep, 1, H_DOT_H);
+      gfx->drawPixel(cx, H_DOT_Y + H_DOT_H - ey,     COL_GREEN);
+      gfx->drawPixel(cx, H_DOT_Y + H_DOT_H - ey + 1, COL_GREEN);
+    }
+
+    // Deauth dot (red): from bottom
+    uint8_t da = hashDeauthBuf[histIdx];
+    if (da > 0) {
+      int dy = constrain((int)da, 1, H_DOT_H);
+      gfx->drawPixel(cx, H_DOT_Y + H_DOT_H - dy,     COL_RED);
+      gfx->drawPixel(cx, H_DOT_Y + H_DOT_H - dy + 1, COL_RED);
+    }
+  }
+
+  // Units2 strip (right side of dot chart)
+  gfx->fillRect(H_DOT_W, H_DOT_Y, H_UNITS2_W, H_DOT_H, COL_BG);
+  gfx->setTextSize(1);
+  // RSSI
+  gfx->setTextColor(COL_YELLOW);
+  gfx->setCursor(H_DOT_W + 1, H_DOT_Y + 2);
+  gfx->printf("%4d", (int)hashLastRSSI);
+  // Total EAPOL
+  gfx->setTextColor(COL_GREEN);
+  gfx->setCursor(H_DOT_W + 1, H_DOT_Y + 18);
+  gfx->printf("%4d", hashEapolTotal);
+  // Total deauth
+  gfx->setTextColor(COL_RED);
+  gfx->setCursor(H_DOT_W + 1, H_DOT_Y + 34);
+  gfx->printf("%4d", hashDeauthCount);
+  // AP count
+  gfx->setTextColor(COL_WHITE);
+  gfx->setCursor(H_DOT_W + 1, H_DOT_Y + 50);
+  gfx->printf("%4d", hashAPCount);
+
+  // ── Status footer (last SSID + last EAPOL) ───────────────────────────────────
+  gfx->fillRect(0, H_FOOT_Y, SCREEN_W, H_FOOT_H, 0x00C0);
+  gfx->setTextSize(1);
+  // Last beacon: SSID rssi mac
+  char foot1[48];
+  snprintf(foot1, sizeof(foot1), "%-14.14s %4d %s", hashLastSSID, (int)hashLastRSSI, hashLastSSIDMac);
+  gfx->setTextColor(COL_DIM); gfx->setCursor(2, H_FOOT_Y + 3); gfx->print(foot1);
+  // Last EAPOL: SSID mac  (on same line, right half)
+  char foot2[40];
+  snprintf(foot2, sizeof(foot2), " %-12.12s %s", hashLastEapolSSID, hashLastEapolMac);
+  gfx->setTextColor(COL_GREEN); gfx->setCursor(162, H_FOOT_Y + 3); gfx->print(foot2);
+
+  gfx->drawFastHLine(0, H_FOOT_Y + H_FOOT_H, SCREEN_W, COL_DIVIDER);
+}
+
 // ─── Full redraw ─────────────────────────────────────────────────────────────
 static void redrawAll() {
   switch (sc_mode) {
@@ -753,6 +1115,7 @@ static void redrawAll() {
     case MODE_DEAUTH:  renderDeauth();  break;
     case MODE_BLE:     renderBLE();     break;
     case MODE_SHADY:   renderShady();   break;
+    case MODE_HASH:    renderHash();    break;
   }
   drawFooter();
   sc_redraw = false;
@@ -802,6 +1165,14 @@ static void handleTouch() {
       case MODE_SHADY:
         if(upper){ if(sc_shadyScroll>0){sc_shadyScroll--;sc_redraw=true;} }
         else     { if(sc_shadyScroll+SHADY_VISIBLE<shadyNetCount){sc_shadyScroll++;sc_redraw=true;} }
+        break;
+      case MODE_HASH:
+        // Tap body to reset EAPOL capture log
+        portENTER_CRITICAL(&hashMux);
+        hashCaptureHead=0; hashCaptureCount=0;
+        hashEapolTotal=0; hashDeauthCount=0;
+        portEXIT_CRITICAL(&hashMux);
+        sc_redraw=true;
         break;
     }
   }
@@ -879,7 +1250,7 @@ void setup() {
   gfx->setTextSize(1); gfx->setTextColor(COL_DIM);
   gfx->setCursor(48,88);  gfx->print("Advanced 802.11 + BLE Scanner");
   gfx->setTextColor(COL_GREEN);
-  gfx->setCursor(4,108);  gfx->print("[ SCAN | PROBE | CHAN | DAUTH | BLE | SHADY ]");
+  gfx->setCursor(4,108);  gfx->print("[ SCAN | PROBE | CHAN | DAUTH | BLE | SHADY | HASH ]");
   gfx->setTextColor(COL_DIM);
   gfx->setCursor(64,128); gfx->print("Serial @ 115200 baud");
   gfx->setCursor(64,140); gfx->print(sdOK ? "SD card: OK" : "SD card: none");
@@ -1021,6 +1392,55 @@ void loop() {
       } else {
         runShadyScan();
         if (shadyNetCount>0) ledFlash(true,true,false,100); // yellow = shady network
+      }
+      break;
+
+    // ── HASH ──────────────────────────────────────────────────────────────────
+    case MODE_HASH:
+      // Channel hop every HASH_HOP_MS
+      if (now - sc_hashLastHop >= HASH_HOP_MS) {
+        sc_hashChan = (sc_hashChan % 13) + 1;
+        esp_wifi_set_channel(sc_hashChan, WIFI_SECOND_CHAN_NONE);
+        sc_hashLastHop = now;
+      }
+      // Drain EAPOL packet queue to SD
+      hashFlushQueue();
+      // Every second: commit per-second stats into history ring buffers
+      if (now - sc_hashLastDraw >= 1000) {
+        sc_hashLastDraw = now;
+        // Snapshot volatile counters atomically
+        portENTER_CRITICAL(&hashMux);
+        uint32_t pktSnap    = hashTmpPktCount; hashTmpPktCount = 0;
+        int32_t  rssiSnap   = hashRssiSum;     hashRssiSum     = 0;
+        uint32_t eapolSnap  = hashEapolSec;    hashEapolSec    = 0;
+        uint32_t deauthSnap = hashDeauthSec;   hashDeauthSec   = 0;
+        portEXIT_CRITICAL(&hashMux);
+
+        int8_t rssiAvg = (pktSnap > 0) ? (int8_t)(rssiSnap / (int32_t)pktSnap) : 0;
+
+        hashPktsBuf[hashHistHead]   = pktSnap;
+        hashRssiBuf[hashHistHead]   = rssiAvg;
+        hashEapolBuf[hashHistHead]  = (uint8_t)min((uint32_t)255, eapolSnap);
+        hashDeauthBuf[hashHistHead] = (uint8_t)min((uint32_t)255, deauthSnap);
+        hashHistHead = (hashHistHead + 1) % HASH_HIST_W;
+        if (hashHistHead == 0) hashHistFull = true;
+
+        Serial.printf("[HASH] CH:%02d pkt:%lu RSSI:%d EAPOL:%d/%d D:%d AP:%d\n",
+          sc_hashChan, (unsigned long)pktSnap, (int)rssiAvg, (int)eapolSnap,
+          hashEapolTotal, hashDeauthCount, hashAPCount);
+        sc_redraw = true;
+      }
+      // Log new EAPOL captures to SD text
+      if (hashUpdated) {
+        hashUpdated = false;
+        portENTER_CRITICAL(&hashMux);
+        int idx = (hashCaptureHead - 1 + HASH_CAP_MAX) % HASH_CAP_MAX;
+        char ssid[33]; strncpy(ssid, hashCaptures[idx].ssid, 32); ssid[32]='\0';
+        char bssid[18]; strncpy(bssid, hashCaptures[idx].bssid, 17); bssid[17]='\0';
+        portEXIT_CRITICAL(&hashMux);
+        char line[64]; snprintf(line, sizeof(line), "SSID:\"%s\" BSSID:%s EAPOL#%d", ssid, bssid, hashEapolTotal);
+        Serial.printf("[HASH EAPOL] %s\n", line); sdLog("HASH", line);
+        ledFlash(false, true, false, 150);
       }
       break;
   }

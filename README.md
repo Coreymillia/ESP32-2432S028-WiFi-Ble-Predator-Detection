@@ -163,7 +163,7 @@ pio device monitor
 ## Known Issues & Notes
 
 ### ⚠️ First Boot: Switch Away from SCAN Before Using It
-On first flash or cold boot, **tap any other mode first** (e.g. PROBE, CHAN) and then return to SCAN. Going straight into SCAN immediately after boot it will find NO NETWORKS. This is a known quirk of the WiFi stack initialization timing — harmless, and a fix may come in a future update.
+On first flash or cold boot, **tap any other mode first** (e.g. PROBE, CHAN) and then return to SCAN. Going straight into SCAN immediately after boot can cause a crash/reboot. This is a known quirk of the WiFi stack initialization timing — harmless, and a fix may come in a future update.
 
 ---
 
