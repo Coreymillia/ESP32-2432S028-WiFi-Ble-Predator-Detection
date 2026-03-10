@@ -1,6 +1,6 @@
 # CYD Advanced WiFi & BLE Scanner
 
-A feature-rich wireless security scanner, sniffer, and human presence detector for the **ESP32-2432S028R (CYD — Cheap Yellow Display)**. Nine independent scanning modes accessible from a touch footer bar, including a two-device WiFi CSI-based presence detection system.
+A feature-rich wireless security scanner, sniffer, and human presence detector for the **ESP32-2432S028R (CYD — Cheap Yellow Display)**. Nine independent scanning modes accessible from a touch footer bar, including a **WiFi RF beam-break presence detection system** that actually works — no PIR sensor, no camera, no special hardware.
 
 > **Hardware:** ESP32-2432S028R · ILI9341 320×240 touchscreen · XPT2046 touch · RGB LED · SD card (optional)
 
@@ -14,18 +14,27 @@ A feature-rich wireless security scanner, sniffer, and human presence detector f
 
 *15 networks sorted by signal strength with live bars, dBm, channel, and encryption type · Channel activity heatmap hopping 1–13 · BLE device hunter showing MAC + RSSI*
 
+| HASH Mode | AP Dashboard |
+|-----------|--------------|
+| ![HASH](IMG_20260309_231850.jpg) | ![AP](IMG_20260309_231350.jpg) |
+
+*HASH: dual-graph WPA handshake sniffer — packet rate bars (top) + RSSI/EAPOL/deauth dot graph (bottom), 28 APs and 4 EAPOL frames captured · AP dashboard: 2 of 3 nodes connected — NODE2 clear, NODE3 at 100% PRESENT with full red sparkline*
+
 ---
 
-## Two Firmware Builds
+## Two Firmware Builds + Headless Node
 
-This repo contains **two separate firmware builds** — functionally identical, differing only in display hardware:
+This repo contains **three firmware builds**:
 
 | Folder | Board | Display |
 |--------|-------|---------|
 | `src/` | Standard CYD (ESP32-2432S028R) | Normal color polarity |
 | `InvertedCYDWifiScanner/` | Inverted CYD variant | `invertDisplay(true)` applied |
+| `C3PRES/` | ESP32-C3 (any variant, no screen) | Headless — LED only |
 
-Flash the correct one for your board. If colors look wrong (white appears black, green appears magenta), use the inverted build.
+Flash the correct CYD build for your board. If colors look wrong (white appears black, green appears magenta), use the inverted build.
+
+The **C3PRES** firmware runs on a bare ESP32-C3 with no screen — it boots directly into presence detection mode and reports telemetry to the AP. LED on GPIO 8 indicates state (fast blink = connecting, triple flash = calibrating, heartbeat = clear, solid = present).
 
 ---
 
@@ -95,64 +104,113 @@ Promiscuous capture of WPA2 handshake (EAPOL) frames with PCAP file output.
 - Channel hops across all 13 channels every 500ms
 - Footer shows last beacon SSID/MAC and last EAPOL SSID/MAC
 
-### `[AP]` — CSI Ping Access Point *(Board 1)*
-Turns this CYD into a soft access point that broadcasts WiFi packets for CSI-based presence detection.
+### `[AP]` — RF Beam Access Point *(Hub device)*
+Turns this CYD into the center of the presence detection network. Acts as both the WiFi AP that PRES nodes connect to and a live **multi-node dashboard** showing all connected sensors.
 
 - Creates AP: **SSID:** `CYD_CSI` · **Password:** `cydscanner123`
-- Sends UDP broadcast pings at 50/sec (20ms interval) to keep CSI frame delivery flowing
-- 40ms beacon interval for maximum CSI trigger frequency
-- Shows connected client count and ping counter
-- Used together with a second CYD running `[PRES]` mode
+- Runs a TCP server (port 80) streaming `ping\n` every 20ms — constant bidirectional traffic is what makes RSSI-based detection reliable
+- Receives UDP telemetry from each connected PRES node
+- **Live dashboard**: up to 3 PRES nodes displayed simultaneously, each with:
+  - Status label (`>> PRESENT` / `?? MAYBE` / `-- CLEAR`) color-coded red/yellow/green
+  - Live confidence percentage
+  - Full-width sparkline graph of signal deviation history
+  - Current DIFF (dBm deviation) and raw RSSI values
+- Stale nodes (no packet for 5+ seconds) dim automatically
+- Place this device centrally; surround with PRES/C3PRES nodes
 
-### `[PRES]` — Human Presence Detector *(Board 2)*
-Connects to a `[AP]`-mode CYD and uses **WiFi Channel State Information (CSI)** variance to detect human presence.
+### `[PRES]` — Human Presence Detector *(Sensor device)*
+Connects to an `[AP]`-mode CYD and uses **WiFi RSSI beam-break detection** to sense human presence. Your body absorbs and reflects 2.4GHz WiFi — when you cross the signal path between devices, the received signal strength drops measurably.
 
-- Measures how a human body disturbs the WiFi signal between the two devices
-- Rolling 30-frame variance window updated every 100ms
+- Exponential moving average (EMA, α=0.15) smooths raw RSSI readings
+- Deviation from calibrated empty-room baseline drives detection
 - Three detection states: **`-- CLEAR`** · **`?? MAYBE`** · **`>> PRESENT`**
 - Confidence bar (0–100%) with color coding
-- CSI variance sparkline with threshold lines always visible
-- Peak variance tracker (`PK:`) to help tune detection thresholds
-- **Tap to calibrate**: 6-second countdown — tap, walk out of signal path, green LED flash = done
-- **Tap again** to reset a bad calibration
+- Full-width sparkline with red/yellow threshold lines always visible
+- Peak deviation tracker (`PK:`) to help tune thresholds
+- **Auto-calibrates 10 seconds after connecting** — no manual step needed
+  - Screen shows `auto-cal in Xs` countdown while waiting
+  - Tap to calibrate immediately instead of waiting
+  - Tap again at any time to reset a bad calibration
+- Sends live telemetry to the AP dashboard every 100ms
 - RGB LED: **red** = present · **yellow** = maybe · **off** = clear
 - Logs presence events to SD card
 
 ---
 
-## Presence Detection Setup
+## Presence Detection — How It Actually Works
 
-The `[AP]` + `[PRES]` modes work as a two-device system. **Both CYDs run the same firmware** — just select the mode you want.
+### The physics
 
-### How it works
-The AP device sends constant WiFi packets. A human body absorbs and reflects 2.4GHz WiFi significantly — the PRES device measures how the received signal changes (CSI variance) and infers whether someone is in the signal path.
+2.4GHz WiFi is absorbed and reflected by the human body. When a person stands or moves in the signal path between two devices, the received signal strength (RSSI) drops by a measurable amount — typically 4–15 dBm depending on distance and body angle. This is the same principle as a microwave motion sensor, except we're using WiFi hardware you already have.
 
-> **Important:** This detects **movement**, not static presence. Someone sitting perfectly still will eventually read as CLEAR. Walking through the signal path reliably triggers detection.
-
-### Placement
-- Put the two devices **on opposite sides** of the area you want to monitor, facing each other
-- **3–15 feet apart** is the sweet spot
-- Line of sight is ideal but not required — works through walls with reduced sensitivity
-- Avoid placement near metal, fish tanks, microwaves, or anything that moves on its own
-- For whole-home coverage in a small space: AP in center, multiple PRES devices around the perimeter
-
-### Calibration
-1. Let the PRES device connect and wait for `FR` to stabilize (~10–20/s)
-2. **Tap the screen** — display shows `LEAVE ROOM — calibrating in 6s...`
-3. Step out of the signal path (or to the side) during the countdown
-4. Green LED flash = calibration complete — the empty-room baseline is now set
-5. Walk back through the signal path — confidence should rise
-6. **Tap again** at any time to reset a bad calibration and start over
-
-### Tuning
-The detection thresholds are defined at the top of `main.cpp`:
-
-```cpp
-#define CSI_VAR_LO   3.0f  // variance below this → empty room (0% confidence)
-#define CSI_VAR_HI   6.0f  // variance above this → definitely present (100% confidence)
+```
+[AP / CYD #1] ──────── RF path ──────── [PRES / CYD #2 or C3]
+                           👤
+                      person here
+                   (absorbs 2.4GHz)
+                  RSSI drops ↓ → detected
 ```
 
-Watch the `PK:` (peak variance) value on the PRES display while moving around. Set `CSI_VAR_HI` to roughly your observed peak. Set `CSI_VAR_LO` to the idle variance when the room is empty.
+### Why this works better than CSI variance
+
+We started with WiFi Channel State Information (CSI) subcarrier variance — a technique used in research papers for through-wall presence detection. In practice on these ESP32 boards, CSI callbacks only fire on received ACK frames, which meant the AP needed to actively receive unicast packets for detection to work at all. Even after fixing that, the variance values were inconsistent and hard to threshold reliably.
+
+**RSSI beam-break is simpler, more reliable, and immediate:**
+- The PRES device reads `WiFi.RSSI()` every 100ms and feeds it into an exponential moving average
+- At calibration time the clean baseline is stored
+- Every subsequent reading is compared: `deviation = |movingAvg - baseline|`
+- Deviation above threshold = detection
+
+No CSI callbacks, no frame counting, no timing tricks — just signal strength math.
+
+### The traffic requirement
+
+Raw `WiFi.RSSI()` on a connected STA reflects the last received beacon or ACK. If there's no active traffic, the value barely changes even when someone walks through the path. The AP's TCP server solves this: it streams `ping\n` every 20ms to any connected client, and the PRES nodes send UDP telemetry every 100ms back to the AP. This bidirectional traffic means fresh ACKs are constantly flowing, so every `RSSI()` call reflects the current signal state.
+
+### Network topology
+
+```
+         [C3PRES]
+            |
+[PRES CYD] ─┼─ WiFi ─── [AP CYD dashboard]
+            |
+         [PRES CYD]
+```
+
+All nodes connect to the AP's softAP. The AP shows a live 3-panel dashboard with one graph per node. Each PRES node (CYD or C3) independently measures its own signal path to the AP.
+
+### Setup
+
+1. **One CYD as AP**: tap `[AP]` — it creates the network and waits
+2. **Remaining CYDs as PRES**: tap `[PRES]` — each connects automatically
+3. **C3PRES nodes**: flash and power on — they connect and calibrate without any interaction
+4. Each PRES device **auto-calibrates 10 seconds after connecting** — just make sure the signal path is clear during that window
+5. Walk through the beam — detection is immediate
+
+### Placement
+
+- Devices **facing each other across the space** you want to monitor — 3–15 feet apart
+- Line of sight is best; works through interior walls with reduced sensitivity
+- Place the AP centrally and surround it with PRES nodes for multi-zone coverage
+- Avoid placement near metal, fish tanks, or anything that moves independently
+- Same height as the area of interest (chest-height for a hallway, floor-level for under a door)
+
+### Calibration
+
+- Auto-calibrates 10s after connecting — screen shows `auto-cal in Xs` countdown
+- Tap during countdown to calibrate immediately
+- Tap at any time after calibration to reset (re-calibrates from scratch on next connect)
+- Green LED flash = calibration complete
+
+### Tuning
+
+```cpp
+#define RSSI_DIFF_LO     3.0f   // dBm deviation → MAYBE (>0% confidence)
+#define RSSI_DIFF_HI     8.0f   // dBm deviation → PRESENT (100% confidence)
+#define RSSI_AVG_ALPHA   0.15f  // EMA smoothing (lower = smoother but slower)
+```
+
+Watch `PK:` (peak deviation) on the PRES screen while walking through the beam. Set `RSSI_DIFF_HI` to roughly your observed peak. `RSSI_AVG_ALPHA` — lower values (0.05–0.10) are more stable but slower to react; higher (0.20–0.30) react faster but noisier.
 
 ---
 
@@ -226,15 +284,16 @@ SD card is optional — the scanner runs fully without one.
 **Requirements:** PlatformIO (VS Code extension or CLI)
 
 ```bash
-# Build standard firmware
+# Build and flash standard CYD firmware
 cd CYDWiFiScanner
-pio run
-
-# Flash (CYD connected via USB)
 pio run --target upload
 
-# Build inverted display firmware
+# Build and flash inverted display firmware
 cd InvertedCYDWifiScanner
+pio run --target upload
+
+# Build and flash C3PRES headless node
+cd CYDWiFiScanner/C3PRES
 pio run --target upload
 
 # Monitor serial output (115200 baud)
@@ -245,6 +304,7 @@ pio device monitor
 - `board_build.partitions = huge_app.csv` — required for BLE (3MB app partition)
 - `board_build.f_cpu = 240000000L` — full 240MHz for responsive UI
 - BLE enabled via `-DCONFIG_BT_ENABLED=1 -DCONFIG_BLUEDROID_ENABLED=1`
+- C3PRES uses default partitions (no BLE needed)
 
 ---
 
@@ -253,8 +313,14 @@ pio device monitor
 ### ⚠️ First Boot: Switch Away from SCAN Before Using It
 On first flash or cold boot, **tap any other mode first** (e.g. PROBE, CHAN) and then return to SCAN. Going straight into SCAN immediately after boot can cause a crash/reboot. This is a known quirk of the WiFi stack initialization timing — harmless.
 
-### ⚠️ PRES Mode: RSSI -81 or Lower
-If RSSI on the PRES device is below -70, move the two devices closer together. Weak signal degrades CSI quality and reduces detection sensitivity. Target -40 to -60 dBm for best results.
+### ⚠️ PRES Mode: Keep the Signal Path Clear for 10 Seconds After Connecting
+Auto-calibration fires 10 seconds after the PRES device connects. If someone is standing in the beam during that window, the baseline will be set with a person in it — making subsequent detection unreliable. Either clear the area during boot, or tap to reset and re-calibrate once the area is empty.
+
+### ⚠️ PRES Mode: RSSI Below -70
+If RSSI on the PRES device is consistently below -70 dBm, move the devices closer together. Weak signal reduces the measurable delta when a person walks through — target -40 to -60 dBm for best results.
+
+### ℹ️ Detection is beam-break, not whole-room
+The PRES/C3PRES devices detect disturbances specifically in the signal path between themselves and the AP. Someone in another part of the room who isn't crossing that path may not register. Use multiple nodes at different angles for broader coverage.
 
 ---
 
@@ -274,7 +340,8 @@ An external antenna improves WiFi and BLE scan range significantly, which direct
 | Version | Description |
 |---------|-------------|
 | **Jan 2026** (`OriginalPredDetectorJan2026/`) | Original ESP32-2432S028 predator detection — BLE skimmer hunter, shady WiFi analyzer, PineAP detection |
-| **Mar 2026** (current `src/`) | Full rewrite: 9-mode scanner, WPA handshake capture, PCAP logging, WiFi CSI presence detection (AP + PRES modes), calibration countdown, inverted display variant |
+| **Mar 2026 v1** | Full rewrite: 9-mode scanner, WPA handshake capture, PCAP logging, initial WiFi CSI presence detection (AP + PRES modes), calibration countdown, inverted display variant |
+| **Mar 2026 v2** (current `src/`) | Detection rebuilt from scratch: replaced CSI variance with **RSSI EMA beam-break detection** — immediate, reliable, works on all ESP32 variants. Added AP multi-node dashboard (up to 3 live PRES nodes with sparklines). Added headless ESP32-C3 PRES node firmware (`C3PRES/`). Auto-calibration on connect. |
 
 The `OriginalPredDetectorJan2026/` folder is preserved as the pre-merge reference.
 

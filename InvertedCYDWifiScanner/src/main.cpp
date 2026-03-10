@@ -426,6 +426,27 @@ static char hashLastEapolSSID[33] = "[none]";
 static char hashLastEapolMac[18]  = {0};
 static uint8_t hashOldChan        = 0; // track channel changes for graph annotation
 
+// ─── Multi-node presence dashboard (AP side) ─────────────────────────────────
+#define MAX_PRES_NODES     3
+#define NODE_TIMEOUT_MS    5000UL   // node goes dim after 5s no packet
+#define NODE_HIST_W        270      // sparkline width per node (pixels)
+#define NODE_PANEL_H       60       // height of each node panel in body
+// Panel body starts at BODY_Y. 3 panels × 60px = 180px (fits in 192px body)
+
+struct PresNode {
+  uint32_t     ip;            // last octet used as node ID
+  uint8_t      confidence;    // 0-100
+  float        rssiDiff;      // deviation from baseline
+  int8_t       rssi;          // raw RSSI
+  unsigned long lastSeen;     // millis of last packet
+  float        history[NODE_HIST_W];
+  int          histHead;
+  bool         histFull;
+};
+
+static PresNode presNodes[MAX_PRES_NODES];
+static int      presNodeCount = 0;
+
 // ─── AP mode state (Board 1: soft-AP + TCP ping server) ──────────────────────
 #define AP_SSID      "CYD_CSI"
 #define AP_PASS      "cydscanner123"
@@ -466,6 +487,7 @@ static uint8_t       presState           = PRES_CONNECTING;
 static unsigned long presConnStart       = 0;
 static unsigned long presLastDraw        = 0;
 static unsigned long presLastKeepalive   = 0;
+static unsigned long presAutoCalStart    = 0;  // when stable connection was established
 static WiFiUDP       presUdp;
 static bool          presUdpStarted      = false;
 
@@ -507,6 +529,27 @@ static void apTcpServerTask(void* arg) {
     vTaskDelay(pdMS_TO_TICKS(5));
   }
   vTaskDelete(NULL);
+}
+
+// Find or register a presence node by IP last octet. Returns index or -1 if full.
+static int getOrAddNode(uint32_t ipLastOctet) {
+  for (int i = 0; i < presNodeCount; i++) {
+    if (presNodes[i].ip == ipLastOctet) return i;
+  }
+  if (presNodeCount < MAX_PRES_NODES) {
+    int idx = presNodeCount++;
+    memset(&presNodes[idx], 0, sizeof(PresNode));
+    presNodes[idx].ip = ipLastOctet;
+    return idx;
+  }
+  // Table full — find oldest inactive node and replace
+  int oldest = 0;
+  for (int i = 1; i < MAX_PRES_NODES; i++) {
+    if (presNodes[i].lastSeen < presNodes[oldest].lastSeen) oldest = i;
+  }
+  memset(&presNodes[oldest], 0, sizeof(PresNode));
+  presNodes[oldest].ip = ipLastOctet;
+  return oldest;
 }
 
 // ─── PCAP helpers ─────────────────────────────────────────────────────────────
@@ -798,6 +841,9 @@ static void enterMode(int m) {
       esp_wifi_set_inactive_time(WIFI_IF_AP, 300);
       esp_wifi_set_ps(WIFI_PS_NONE);
       apUdp.begin(AP_PORT); apUdpStarted=true;
+      // Clear node tracking
+      memset(presNodes, 0, sizeof(presNodes));
+      presNodeCount = 0;
       apTcpHandle = NULL;
       xTaskCreate(apTcpServerTask, "apTcp", 4096, NULL, 5, &apTcpHandle);
       Serial.printf("[AP] SSID=%s  IP=%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
@@ -808,7 +854,7 @@ static void enterMode(int m) {
       csiCalibrated=false; csiCalPending=false; csiCalCountStart=0;
       rssiMovAvg=0.0f; presSampleCount=0; csiLastRSSI=0;
       memset(csiHistBuf,0,sizeof(csiHistBuf)); csiHistHead=0; csiHistFull=false; csiLastSec=0;
-      presState=PRES_CONNECTING; presConnStart=millis(); presLastDraw=0; presLastKeepalive=0; presUdpStarted=false;
+      presState=PRES_CONNECTING; presConnStart=millis(); presLastDraw=0; presLastKeepalive=0; presUdpStarted=false; presAutoCalStart=0;
       WiFi.begin(AP_SSID, AP_PASS);
       Serial.printf("[PRES] Connecting to %s...\n", AP_SSID);
       break;
@@ -1234,40 +1280,109 @@ static void renderHash() {
 
 // ─── AP renderer ─────────────────────────────────────────────────────────────
 static void renderAP() {
-  gfx->fillRect(0, BODY_Y, SCREEN_W, BODY_H, COL_BG);
   int clients = WiFi.softAPgetStationNum();
   char hdr[52];
-  snprintf(hdr, sizeof(hdr), "%s  %s  clients:%d",
-           AP_SSID, WiFi.softAPIP().toString().c_str(), clients);
+  snprintf(hdr, sizeof(hdr), "AP  %s  nodes:%d/%d", AP_SSID, presNodeCount, MAX_PRES_NODES);
   drawHeader(hdr);
+  gfx->fillRect(0, BODY_Y, SCREEN_W, BODY_H, COL_BG);
 
-  gfx->setTextSize(2); gfx->setTextColor(COL_GREEN);
-  gfx->setCursor(52, BODY_Y + 10); gfx->print("AP  ACTIVE");
+  unsigned long now = millis();
 
-  gfx->drawFastHLine(0, BODY_Y + 34, SCREEN_W, COL_DIVIDER);
-  gfx->setTextSize(1);
-  gfx->setTextColor(COL_DIM);  gfx->setCursor(4, BODY_Y + 42); gfx->print("SSID:");
-  gfx->setTextColor(COL_GREEN); gfx->print(" " AP_SSID);
-  gfx->setTextColor(COL_DIM);  gfx->setCursor(4, BODY_Y + 56); gfx->print("PASS:");
-  gfx->setTextColor(COL_WHITE); gfx->print(" " AP_PASS);
-  gfx->setTextColor(COL_DIM);  gfx->setCursor(4, BODY_Y + 70); gfx->print("IP:  ");
-  gfx->setTextColor(COL_CYAN);  gfx->print(" "); gfx->print(WiFi.softAPIP().toString().c_str());
+  if (presNodeCount == 0) {
+    // No nodes yet — show waiting screen
+    gfx->setTextSize(2); gfx->setTextColor(COL_DIM);
+    gfx->setCursor(30, BODY_Y + 30); gfx->print("Waiting for");
+    gfx->setCursor(30, BODY_Y + 56); gfx->print("PRES nodes...");
+    gfx->setTextSize(1); gfx->setTextColor(COL_DIM);
+    gfx->setCursor(4, BODY_Y + 100); gfx->print("SSID: " AP_SSID);
+    gfx->setCursor(4, BODY_Y + 114); gfx->print("PASS: " AP_PASS);
+    gfx->setCursor(4, BODY_Y + 128); gfx->print("IP:   192.168.4.1");
+    return;
+  }
 
-  gfx->drawFastHLine(0, BODY_Y + 84, SCREEN_W, COL_DIVIDER);
-  char buf[48];
-  gfx->setTextColor(COL_WHITE); gfx->setTextSize(1);
-  snprintf(buf, sizeof(buf), "Clients: %d", clients);
-  gfx->setCursor(4, BODY_Y + 92); gfx->print(buf);
-  snprintf(buf, sizeof(buf), "Pings:   %lu  (50/sec)", apPingCount);
-  gfx->setCursor(4, BODY_Y + 106); gfx->print(buf);
-  gfx->setTextColor(COL_DIM);
-  gfx->setCursor(4, BODY_Y + 120); gfx->print("Beacon:  40ms interval");
+  for (int ni = 0; ni < presNodeCount && ni < MAX_PRES_NODES; ni++) {
+    PresNode& n     = presNodes[ni];
+    int       panY  = BODY_Y + ni * NODE_PANEL_H;
+    bool      stale = (now - n.lastSeen) > NODE_TIMEOUT_MS;
 
-  gfx->drawFastHLine(0, BODY_Y + 134, SCREEN_W, COL_DIVIDER);
-  gfx->setTextColor(COL_DIM); gfx->setTextSize(1);
-  gfx->setCursor(4, BODY_Y + 142); gfx->print("Board 1: keep this CYD in AP mode.");
-  gfx->setCursor(4, BODY_Y + 156); gfx->print("Board 2: connect to this AP,");
-  gfx->setCursor(4, BODY_Y + 170); gfx->print("         then tap [PRES] below.");
+    // ── Status row ───────────────────────────────────────────────────────────
+    uint8_t conf = stale ? 0 : n.confidence;
+    uint16_t statusCol = COL_DIM;
+    const char* statusLabel = "-- CLEAR";
+    if (!stale) {
+      if      (conf >= 60) { statusCol = COL_RED;    statusLabel = ">> PRESENT"; }
+      else if (conf >= 30) { statusCol = COL_YELLOW; statusLabel = "?? MAYBE";   }
+      else                 { statusCol = COL_GREEN;  statusLabel = "-- CLEAR";   }
+    }
+
+    // Node label + conf %
+    char row[40];
+    gfx->setTextSize(1);
+    gfx->setTextColor(stale ? COL_DIM : COL_WHITE);
+    snprintf(row, sizeof(row), "NODE%lu", (unsigned long)n.ip);
+    gfx->setCursor(4, panY + 2);  gfx->print(row);
+
+    gfx->setTextColor(statusCol);
+    gfx->setCursor(56, panY + 2); gfx->print(statusLabel);
+
+    // Conf % right-aligned
+    snprintf(row, sizeof(row), "%3d%%", conf);
+    gfx->setTextColor(stale ? COL_DIM : COL_WHITE);
+    gfx->setCursor(SCREEN_W - 30, panY + 2); gfx->print(row);
+
+    // ── Mini sparkline ───────────────────────────────────────────────────────
+    int sparkY = panY + 16;
+    int sparkH = NODE_PANEL_H - 20;  // ~40px
+    int histLen = n.histFull ? NODE_HIST_W : n.histHead;
+
+    // Find max for scaling — always at least RSSI_DIFF_HI
+    float scaleMax = RSSI_DIFF_HI * 1.5f;
+    for (int i = 0; i < histLen; i++) {
+      if (n.history[i] > scaleMax) scaleMax = n.history[i];
+    }
+
+    // Draw sparkline bars
+    int availW  = NODE_HIST_W;
+    int startX  = SCREEN_W - availW - 4;
+
+    gfx->fillRect(startX, sparkY, availW, sparkH, COL_BG);
+
+    for (int col = 0; col < availW; col++) {
+      int hidx;
+      if (n.histFull) {
+        hidx = (n.histHead + col - availW + NODE_HIST_W) % NODE_HIST_W;
+      } else {
+        int offset = col - (availW - n.histHead);
+        if (offset < 0) continue;
+        hidx = offset;
+      }
+      float v = n.history[hidx];
+      int barH = constrain((int)(v / scaleMax * sparkH), 0, sparkH);
+      if (barH > 0) {
+        uint16_t barCol = stale ? COL_DIM :
+                          (v >= RSSI_DIFF_HI) ? COL_RED :
+                          (v >= RSSI_DIFF_LO) ? COL_YELLOW : COL_GREEN;
+        gfx->drawFastVLine(startX + col, sparkY + sparkH - barH, barH, barCol);
+      }
+    }
+
+    // Threshold line (LO)
+    int loY = sparkY + sparkH - constrain((int)(RSSI_DIFF_LO / scaleMax * sparkH), 0, sparkH);
+    gfx->drawFastHLine(startX, loY, availW, COL_YELLOW);
+
+    // RSSI + diff stats (small, left side of sparkline area)
+    if (!stale) {
+      char stats[24];
+      snprintf(stats, sizeof(stats), "D:%.1f R:%d", n.rssiDiff, (int)n.rssi);
+      gfx->setTextColor(COL_DIM); gfx->setTextSize(1);
+      gfx->setCursor(4, sparkY + sparkH/2 - 3); gfx->print(stats);
+    }
+
+    // Divider
+    if (ni < presNodeCount - 1) {
+      gfx->drawFastHLine(0, panY + NODE_PANEL_H - 1, SCREEN_W, COL_DIVIDER);
+    }
+  }
 }
 
 // ─── PRESENCE renderer ───────────────────────────────────────────────────────
@@ -1383,8 +1498,13 @@ static void renderPresence() {
              csiVarBaseline, lo, hi);
     gfx->setCursor(4, P_STATS_Y + 14); gfx->print(stats);
   } else {
-    snprintf(stats, sizeof(stats), "UNCAL lo:%.1f hi:%.1f  tap=calibrate",
-             lo, hi);
+    if (presAutoCalStart > 0) {
+      int secsLeft = 10 - (int)((millis() - presAutoCalStart) / 1000);
+      secsLeft = constrain(secsLeft, 0, 10);
+      snprintf(stats, sizeof(stats), "auto-cal in %ds  lo:%.1f hi:%.1f  tap=now", secsLeft, lo, hi);
+    } else {
+      snprintf(stats, sizeof(stats), "UNCAL lo:%.1f hi:%.1f  tap=calibrate", lo, hi);
+    }
     gfx->setCursor(4, P_STATS_Y + 14); gfx->print(stats);
   }
 }
@@ -1747,6 +1867,7 @@ void loop() {
 
     // ── AP ────────────────────────────────────────────────────────────────────
     case MODE_AP:
+      // Send UDP broadcast pings so PRES nodes get ACKs for RSSI measurement
       if (apUdpStarted && now - apLastPing >= AP_PING_MS) {
         apUdp.beginPacket(AP_BCAST_IP, AP_PORT);
         apUdp.print("ping");
@@ -1754,10 +1875,37 @@ void loop() {
         apPingCount++;
         apLastPing = now;
       }
+      // Receive telemetry packets from PRES nodes
+      // Format: "PRES,<conf>,<diff10>,<rssi>"  (diff10 = rssiDiff * 10)
+      if (apUdpStarted) {
+        int pktSize = apUdp.parsePacket();
+        if (pktSize > 0) {
+          char buf[32] = {};
+          int n = apUdp.read(buf, sizeof(buf) - 1);
+          uint8_t conf = 0; int diff10 = 0; int rssiRaw = 0;
+          if (n > 0 && sscanf(buf, "PRES,%hhu,%d,%d", &conf, &diff10, &rssiRaw) == 3) {
+            IPAddress remote = apUdp.remoteIP();
+            int idx = getOrAddNode((uint32_t)remote[3]);
+            if (idx >= 0) {
+              PresNode& nd   = presNodes[idx];
+              nd.confidence  = conf;
+              nd.rssiDiff    = diff10 / 10.0f;
+              nd.rssi        = (int8_t)rssiRaw;
+              nd.lastSeen    = now;
+              nd.history[nd.histHead] = nd.rssiDiff;
+              nd.histHead = (nd.histHead + 1) % NODE_HIST_W;
+              if (nd.histHead == 0) nd.histFull = true;
+              sc_redraw = true;
+              Serial.printf("[AP] NODE%u conf:%d diff:%.1f rssi:%d\n",
+                            (unsigned)remote[3], conf, nd.rssiDiff, rssiRaw);
+            }
+          }
+        }
+      }
+      // Redraw every 2s even with no packets (updates stale state dimming)
       if (now - apLastDraw >= 2000) {
         apLastDraw = now;
         sc_redraw  = true;
-        Serial.printf("[AP] clients:%d  pings:%lu\n", WiFi.softAPgetStationNum(), apPingCount);
       }
       break;
 
@@ -1769,6 +1917,7 @@ void loop() {
           esp_wifi_set_ps(WIFI_PS_NONE);
           presUdp.begin(AP_PORT); presUdpStarted = true;
           presLastKeepalive = now;
+          presAutoCalStart  = now;   // start 10s auto-calibration countdown
           rssiMovAvg = 0.0f;
           presSampleCount = 0;
           csiFrameRate = 10;
@@ -1785,7 +1934,8 @@ void loop() {
         if (now - presLastDraw >= 500) { presLastDraw = now; sc_redraw = true; }
       } else {  // PRES_CSI_ACTIVE
         if (WiFi.status() != WL_CONNECTED) {
-          presState = PRES_CONNECTING; presConnStart = now;
+          presState = PRES_CONNECTING; presConnStart = now; presAutoCalStart = 0;
+          csiCalibrated = false; csiVarBaseline = 0.0f; rssiMovAvg = 0.0f;
           if (presUdpStarted) { presUdp.stop(); presUdpStarted = false; }
           WiFi.begin(AP_SSID, AP_PASS);
           Serial.println("[PRES] Connection lost, reconnecting...");
@@ -1794,11 +1944,26 @@ void loop() {
         // Keepalive: send unicast UDP to AP every 100ms
         if (presUdpStarted && now - presLastKeepalive >= 100) {
           presLastKeepalive = now;
+          // Send telemetry to AP — format: "PRES,<conf>,<diff10>,<rssi>"
+          char telem[32];
+          snprintf(telem, sizeof(telem), "PRES,%hhu,%d,%d",
+                   csiConfidence,
+                   (int)(csiVariance * 10.0f),
+                   (int)csiLastRSSI);
           presUdp.beginPacket("192.168.4.1", AP_PORT);
-          presUdp.print("ka");
+          presUdp.print(telem);
           presUdp.endPacket();
         }
-        // Calibration countdown: fire after PRES_CAL_DELAY_MS with room empty
+        // Auto-calibrate 10s after connecting (assumes room is empty at power-up)
+        if (!csiCalibrated && !csiCalPending && presAutoCalStart > 0
+            && now - presAutoCalStart >= 10000 && rssiMovAvg != 0.0f) {
+          csiVarBaseline = rssiMovAvg;
+          csiCalibrated  = true;
+          sc_redraw      = true;
+          Serial.printf("[PRES] Auto-calibrated: baseline=%.2f\n", csiVarBaseline);
+          ledSet(false, true, false); delay(150); ledOff();
+        }
+        // Manual calibration countdown: fire after PRES_CAL_DELAY_MS with room empty
         if (csiCalPending && now - csiCalCountStart >= PRES_CAL_DELAY_MS) {
           csiCalPending    = false;
           csiVarBaseline   = rssiMovAvg;  // store current smooth RSSI as empty-room baseline
