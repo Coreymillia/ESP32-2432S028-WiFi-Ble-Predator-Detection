@@ -10,7 +10,14 @@
 // MODE_SHADY:   Suspicious network analyzer — scores networks for evil twin, PineAP,
 //               open/hidden/strong-signal/random-SSID threats
 //
-// Footer:  6 equal tap zones = [ SCAN | PROBE | CHAN | DAUTH | BLE | SHADY ]
+// MODE_AP:       CSI ping AP — turns this CYD into Board 1 (soft AP + UDP broadcaster)
+//               Required by PRESENCE mode on a second CYD (Board 2)
+// MODE_PRESENCE: Human presence detector via WiFi CSI — connects to an AP CYD,
+//               measures signal variance across all OFDM subcarriers.
+//               Still room = flat CSI.  Person present/moving = variance spikes.
+//               Tap body to calibrate empty-room baseline.
+//
+// Footer:  9 equal tap zones = [ SCAN | PROBE | CHAN | DAUTH | BLE | SHADY | HASH | AP | PRES ]
 // Theme:   Green-on-black hacker terminal, 320x240 landscape
 // LED:     RGB status LED — green=touch, red=deauth, blue=BLE threat, yellow=shady net
 // SD:      Logs threats to /cydscan.txt when SD card present (HSPI on GPIO 18/19/23/5)
@@ -26,6 +33,7 @@
 #include <BLEAdvertisedDevice.h>
 #include <SD.h>
 #include <FS.h>
+#include <WiFiUdp.h>
 
 // ─── Display — CYD ILI9341 320×240 landscape ────────────────────────────────
 #define GFX_BL 21
@@ -78,7 +86,7 @@ static void sdLog(const char* tag, const char* msg) {
 #define BODY_Y      HEADER_H
 #define BODY_H      192
 #define FOOTER_Y    212
-#define NUM_MODES     6
+#define NUM_MODES     9
 
 // ─── Colors ─────────────────────────────────────────────────────────────────
 #define COL_BG        0x0000
@@ -101,7 +109,10 @@ static void sdLog(const char* tag, const char* msg) {
 #define MODE_DEAUTH  3
 #define MODE_BLE     4
 #define MODE_SHADY   5
-static const char* MODE_NAMES[NUM_MODES] = {"SCAN","PROBE","CHAN","DAUTH","BLE","SHADY"};
+#define MODE_HASH    6
+#define MODE_AP      7
+#define MODE_PRESENCE 8
+static const char* MODE_NAMES[NUM_MODES] = {"SCAN","PROBE","CHAN","DAUTH","BLE","SHADY","HASH","AP","PRES"};
 
 // ─── App state ───────────────────────────────────────────────────────────────
 static int  sc_mode   = -1;
@@ -361,6 +372,190 @@ static const char* shadySuspicionReason(const char* ssid, int rssi, wifi_auth_mo
   return nullptr;
 }
 
+// ─── HASH state (WPA2 handshake / EAPOL capture) ─────────────────────────────
+#define HASH_AP_MAX      80    // known APs tracked from beacons
+#define HASH_CAP_MAX     20    // captured handshakes (for SD logging)
+#define HASH_HOP_MS     500UL  // channel-hop interval
+#define HASH_PKT_QUEUE    8    // in-RAM PCAP packet queue (ISR→main loop SD writes)
+#define HASH_PKT_MAXLEN 296    // max raw 802.11 frame size to capture
+#define HASH_HIST_W     280    // history ring-buffer width (pixels / seconds)
+
+struct HashAP      { uint8_t mac[6]; char ssid[33]; uint8_t ssid_len; };
+struct HashCapture { char ssid[33]; char bssid[18]; unsigned long ts; };
+struct PcapPkt     { uint8_t data[HASH_PKT_MAXLEN]; uint16_t len; unsigned long ts; };
+
+static HashAP      hashAPs[HASH_AP_MAX];
+static int         hashAPCount      = 0;
+static HashCapture hashCaptures[HASH_CAP_MAX];
+static int         hashCaptureHead  = 0;
+static int         hashCaptureCount = 0;
+static int         hashEapolTotal   = 0;
+static int         hashDeauthCount  = 0;
+static portMUX_TYPE hashMux         = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool hashUpdated    = false;
+static uint8_t     sc_hashChan      = 1;
+static unsigned long sc_hashLastHop  = 0;
+static unsigned long sc_hashLastDraw = 0;
+
+// Lock-free single-producer (ISR) / single-consumer (loop) PCAP packet queue
+static PcapPkt      hashPktQueue[HASH_PKT_QUEUE];
+static volatile int hashPktHead = 0;
+static volatile int hashPktTail = 0;
+static File         hashPcapFile;
+static bool         hashPcapOpen = false;
+
+// Per-second stats fed by ISR, consumed by loop every second
+static volatile uint32_t hashTmpPktCount = 0; // all frames this second
+static volatile int32_t  hashRssiSum     = 0; // RSSI sum for averaging
+static volatile uint32_t hashEapolSec    = 0; // EAPOL this second
+static volatile uint32_t hashDeauthSec   = 0; // deauth this second
+
+// Scrolling history ring-buffers (written from loop, read in renderHash)
+static uint32_t hashPktsBuf[HASH_HIST_W];    // packets per second
+static int8_t   hashRssiBuf[HASH_HIST_W];    // average RSSI per second
+static uint8_t  hashEapolBuf[HASH_HIST_W];   // EAPOL per second (capped 60)
+static uint8_t  hashDeauthBuf[HASH_HIST_W];  // deauth per second (capped 60)
+static int      hashHistHead = 0;             // next write position
+static bool     hashHistFull = false;
+
+// Last-seen info updated by ISR
+static char hashLastSSID[33]      = "[none]";
+static char hashLastSSIDMac[18]   = {0};
+static int8_t hashLastRSSI        = 0;
+static char hashLastEapolSSID[33] = "[none]";
+static char hashLastEapolMac[18]  = {0};
+static uint8_t hashOldChan        = 0; // track channel changes for graph annotation
+
+// ─── AP mode state (Board 1: soft-AP + UDP ping broadcaster) ─────────────────
+#define AP_SSID      "CYD_CSI"
+#define AP_PASS      "cydscanner123"
+#define AP_PORT      1234
+#define AP_BCAST_IP  "192.168.4.255"
+#define AP_PING_MS   20UL   // 50 pings/sec → ~50 CSI frames/sec on the STA side
+
+static WiFiUDP       apUdp;
+static bool          apUdpStarted = false;
+static unsigned long apPingCount  = 0;
+static unsigned long apLastPing   = 0;
+static unsigned long apLastDraw   = 0;
+
+// ─── PRESENCE mode state (Board 2: CSI human-presence detector) ──────────────
+// Layout constants for renderPresence()
+#define P_STATUS_Y  (BODY_Y + 8)    // big PRESENT/CLEAR label
+#define P_CONF_Y    (BODY_Y + 48)   // confidence bar
+#define P_CONF_H    14
+#define P_CONF_W    200
+#define P_SPARK_Y   (BODY_Y + 72)   // CSI variance sparkline
+#define P_SPARK_H   72
+#define P_UNITS_W   36              // left units column width
+#define P_SPARK_X   P_UNITS_W
+#define P_SPARK_W   (SCREEN_W - P_UNITS_W) // 284
+#define P_STATS_Y   (BODY_Y + 152)  // stats strip
+
+#define CSI_WIN      30    // rolling variance window (frames)
+#define CSI_HIST_W   284   // sparkline history depth = P_SPARK_W
+#define CSI_VAR_LO   3.0f  // variance below this → empty room
+#define CSI_VAR_HI   25.0f // variance above this → definitely present
+
+#define PRES_CONNECTING  0
+#define PRES_CSI_ACTIVE  1
+
+static uint8_t       presState      = PRES_CONNECTING;
+static unsigned long presConnStart  = 0;
+static unsigned long presLastDraw   = 0;
+static TaskHandle_t  psKillerHandle = NULL;
+static portMUX_TYPE  csiMux         = portMUX_INITIALIZER_UNLOCKED;
+
+// ISR-side rolling amplitude window (one entry per received CSI frame)
+static volatile float    csiWin[CSI_WIN];
+static volatile int      csiWinHead   = 0;
+static volatile bool     csiWinFull   = false;
+static volatile int8_t   csiLastRSSI  = 0;
+static volatile bool     csiUpdated   = false;
+static volatile uint32_t csiFrameSec  = 0;  // frames received this 100 ms tick
+
+// Loop-side processed state
+static float    csiVariance    = 0.0f;
+static uint8_t  csiConfidence  = 0;      // 0-100
+static float    csiVarBaseline = 0.0f;   // calibrated empty-room offset
+static bool     csiCalibrated  = false;
+static uint32_t csiFrameRate   = 0;      // frames/sec (approx)
+
+// Sparkline history (loop-written, render-read)
+static float csiHistBuf[CSI_HIST_W];
+static int   csiHistHead = 0;
+static bool  csiHistFull = false;
+static unsigned long csiLastSec = 0;
+
+// CSI receive callback — called from WiFi task context
+static void IRAM_ATTR onCSI(void* ctx, wifi_csi_info_t* data) {
+  if (!data || !data->buf || data->len == 0) return;
+  float sum = 0;
+  for (int i = 0; i < data->len; i++) sum += (float)abs(data->buf[i]);
+  float amp = sum / (float)data->len;
+  portENTER_CRITICAL_ISR(&csiMux);
+  csiWin[csiWinHead] = amp;
+  csiWinHead = (csiWinHead + 1) % CSI_WIN;
+  if (csiWinHead == 0) csiWinFull = true;
+  csiLastRSSI = (int8_t)data->rx_ctrl.rssi;
+  csiFrameSec++;
+  csiUpdated = true;
+  portEXIT_CRITICAL_ISR(&csiMux);
+}
+
+// Continuously re-asserts WIFI_PS_NONE — the WiFi stack can silently
+// re-enable power-save after internal events, killing CSI frame delivery.
+static void psKillerTask(void* arg) {
+  while (1) {
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// ─── PCAP helpers ─────────────────────────────────────────────────────────────
+static bool hashOpenPcap() {
+  if (!sdOK) return false;
+  char fname[32];
+  snprintf(fname, sizeof(fname), "/hash%lu.pcap", millis());
+  hashPcapFile = SD.open(fname, FILE_WRITE);
+  if (!hashPcapFile) return false;
+  // PCAP global header (little-endian, 802.11 link type = 105)
+  uint8_t hdr[24] = {};
+  uint32_t magic = 0xa1b2c3d4; uint16_t vmaj = 2, vmin = 4;
+  int32_t zone = 0; uint32_t sig = 0, snap = 2500, net = 105;
+  memcpy(hdr+ 0, &magic, 4); memcpy(hdr+ 4, &vmaj,  2);
+  memcpy(hdr+ 6, &vmin,  2); memcpy(hdr+ 8, &zone,  4);
+  memcpy(hdr+12, &sig,   4); memcpy(hdr+16, &snap,  4);
+  memcpy(hdr+20, &net,   4);
+  hashPcapFile.write(hdr, 24);
+  hashPcapFile.flush();
+  Serial.printf("[HASH] PCAP open: %s\n", fname);
+  return true;
+}
+
+static void hashClosePcap() {
+  if (hashPcapOpen) { hashPcapFile.close(); hashPcapOpen = false; }
+}
+
+// Call from main loop to drain packet queue → SD card
+static void hashFlushQueue() {
+  while (hashPktTail != hashPktHead) {
+    int idx = hashPktTail;
+    if (hashPcapOpen) {
+      uint8_t phdr[16];
+      uint32_t ts_sec  = hashPktQueue[idx].ts / 1000;
+      uint32_t ts_usec = (hashPktQueue[idx].ts % 1000) * 1000;
+      uint32_t incl = hashPktQueue[idx].len, orig = hashPktQueue[idx].len;
+      memcpy(phdr+ 0, &ts_sec,  4); memcpy(phdr+ 4, &ts_usec, 4);
+      memcpy(phdr+ 8, &incl,    4); memcpy(phdr+12, &orig,    4);
+      hashPcapFile.write(phdr, 16);
+      hashPcapFile.write(hashPktQueue[idx].data, hashPktQueue[idx].len);
+      hashPcapFile.flush();
+    }
+    hashPktTail = (hashPktTail + 1) % HASH_PKT_QUEUE;
+  }
+}
+
 // ─── Promiscuous callback ─────────────────────────────────────────────────────
 static void IRAM_ATTR onPromisc(void* buf, wifi_promiscuous_pkt_type_t ptype) {
   if (sc_mode == MODE_CHANNEL) {
@@ -370,6 +565,96 @@ static void IRAM_ATTR onPromisc(void* buf, wifi_promiscuous_pkt_type_t ptype) {
     }
     return;
   }
+
+  if (sc_mode == MODE_HASH) {
+    const wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+    const uint8_t* f = pkt->payload;
+    uint32_t sig_len = pkt->rx_ctrl.sig_len;
+    if (ptype == WIFI_PKT_MGMT && sig_len >= 4) sig_len -= 4; // strip FCS
+    if (sig_len < 12 || sig_len > HASH_PKT_MAXLEN) return;
+
+    // Count every packet + RSSI for per-second stats
+    hashTmpPktCount++;
+    hashRssiSum += pkt->rx_ctrl.rssi;
+
+    uint8_t ftype    = (f[0] >> 2) & 0x3;
+    uint8_t fsubtype = (f[0] >> 4) & 0xF;
+
+    // Beacon (type=0, subtype=8): track AP MAC → SSID + update last-seen info
+    if (ftype == 0 && fsubtype == 8 && sig_len >= 42) {
+      uint8_t ssid_len = f[37];
+      if (ssid_len > 0 && ssid_len <= 32 && (uint32_t)(38 + ssid_len) <= sig_len) {
+        const uint8_t* ap_mac = &f[16];
+        portENTER_CRITICAL_ISR(&hashMux);
+        // Store last-seen beacon info for footer display
+        memcpy(hashLastSSID, &f[38], ssid_len); hashLastSSID[ssid_len] = '\0';
+        snprintf(hashLastSSIDMac, 18, "%02x:%02x:%02x:%02x:%02x:%02x",
+                 ap_mac[0],ap_mac[1],ap_mac[2],ap_mac[3],ap_mac[4],ap_mac[5]);
+        hashLastRSSI = (int8_t)pkt->rx_ctrl.rssi;
+        // Add to AP table if new
+        bool known = false;
+        for (int i = 0; i < hashAPCount; i++) {
+          if (memcmp(hashAPs[i].mac, ap_mac, 6) == 0) { known = true; break; }
+        }
+        if (!known && hashAPCount < HASH_AP_MAX) {
+          memcpy(hashAPs[hashAPCount].mac, ap_mac, 6);
+          memcpy(hashAPs[hashAPCount].ssid, &f[38], ssid_len);
+          hashAPs[hashAPCount].ssid[ssid_len] = '\0';
+          hashAPs[hashAPCount].ssid_len = ssid_len;
+          hashAPCount++;
+        }
+        portEXIT_CRITICAL_ISR(&hashMux);
+      }
+    }
+
+    // EAPOL: EtherType 0x888E at offset 30-31 or 32-33
+    if (sig_len >= 34 &&
+        ((f[30] == 0x88 && f[31] == 0x8E) || (f[32] == 0x88 && f[33] == 0x8E))) {
+      const uint8_t* src_mac = &f[16];
+      portENTER_CRITICAL_ISR(&hashMux);
+      hashEapolTotal++;
+      hashEapolSec++;
+      // Resolve SSID from AP table
+      char ssid_buf[33] = "???";
+      for (int i = 0; i < hashAPCount; i++) {
+        if (memcmp(hashAPs[i].mac, src_mac, 6) == 0) {
+          memcpy(ssid_buf, hashAPs[i].ssid, hashAPs[i].ssid_len + 1); break;
+        }
+      }
+      // Update last EAPOL display strings
+      strncpy(hashLastEapolSSID, ssid_buf, 32); hashLastEapolSSID[32] = '\0';
+      snprintf(hashLastEapolMac, 18, "%02x:%02x:%02x:%02x:%02x:%02x",
+               src_mac[0],src_mac[1],src_mac[2],src_mac[3],src_mac[4],src_mac[5]);
+      // Circular capture log (for SD)
+      HashCapture& cap = hashCaptures[hashCaptureHead];
+      strncpy(cap.ssid, ssid_buf, 32); cap.ssid[32] = '\0';
+      snprintf(cap.bssid, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
+               src_mac[0],src_mac[1],src_mac[2],src_mac[3],src_mac[4],src_mac[5]);
+      cap.ts = millis();
+      hashCaptureHead = (hashCaptureHead + 1) % HASH_CAP_MAX;
+      if (hashCaptureCount < HASH_CAP_MAX) hashCaptureCount++;
+      // Queue PCAP write
+      int next = (hashPktHead + 1) % HASH_PKT_QUEUE;
+      if (next != hashPktTail) {
+        PcapPkt& q = hashPktQueue[hashPktHead];
+        q.len = (uint16_t)sig_len; memcpy(q.data, f, sig_len); q.ts = millis();
+        hashPktHead = next;
+      }
+      hashUpdated = true;
+      portEXIT_CRITICAL_ISR(&hashMux);
+      ledFlash(false, true, false, 20);
+    }
+
+    // Deauth / disassoc
+    if (ptype == WIFI_PKT_MGMT && (f[0] == 0xA0 || f[0] == 0xC0)) {
+      portENTER_CRITICAL_ISR(&hashMux);
+      hashDeauthCount++;
+      hashDeauthSec++;
+      portEXIT_CRITICAL_ISR(&hashMux);
+    }
+    return;
+  }
+
   if (ptype != WIFI_PKT_MGMT) return;
   const wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
   const uint8_t* f = pkt->payload;
@@ -437,6 +722,17 @@ static void enterMode(int m) {
     WiFi.scanDelete(); sc_scanRunning = false; sc_shadyRunning = false;
   } else if (sc_mode == MODE_BLE) {
     bleScanActive = false; delay(200);
+  } else if (sc_mode == MODE_HASH) {
+    esp_wifi_set_promiscuous(false);
+    hashClosePcap();
+  } else if (sc_mode == MODE_AP) {
+    if (apUdpStarted) { apUdp.stop(); apUdpStarted = false; }
+    WiFi.softAPdisconnect(true);
+  } else if (sc_mode == MODE_PRESENCE) {
+    esp_wifi_set_csi(false);
+    esp_wifi_set_csi_rx_cb(NULL, NULL);
+    if (psKillerHandle) { vTaskDelete(psKillerHandle); psKillerHandle = NULL; }
+    presState = PRES_CONNECTING;
   } else if (sc_mode >= 0) {
     esp_wifi_set_promiscuous(false);
   }
@@ -471,6 +767,58 @@ static void enterMode(int m) {
     case MODE_SHADY:
       shadyNetCount=0; shadyTotalNets=0; sc_shadyScroll=0; sc_shadyLast=0; sc_shadyRunning=false;
       pineapCount=0;
+      break;
+    case MODE_HASH:
+      portENTER_CRITICAL(&hashMux);
+      hashAPCount=0; hashCaptureHead=0; hashCaptureCount=0;
+      hashEapolTotal=0; hashDeauthCount=0;
+      hashTmpPktCount=0; hashRssiSum=0; hashEapolSec=0; hashDeauthSec=0;
+      hashPktHead=0; hashPktTail=0;
+      hashUpdated=false;
+      memset(hashPktsBuf,  0, sizeof(hashPktsBuf));
+      memset(hashRssiBuf,  0, sizeof(hashRssiBuf));
+      memset(hashEapolBuf, 0, sizeof(hashEapolBuf));
+      memset(hashDeauthBuf,0, sizeof(hashDeauthBuf));
+      hashHistHead=0; hashHistFull=false;
+      hashOldChan=0;
+      strcpy(hashLastSSID,"[none]");      hashLastSSIDMac[0]='\0';
+      strcpy(hashLastEapolSSID,"[none]"); hashLastEapolMac[0]='\0';
+      hashLastRSSI=0;
+      portEXIT_CRITICAL(&hashMux);
+      sc_hashChan=1; sc_hashLastHop=0; sc_hashLastDraw=0;
+      esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+      enablePromisc(true);
+      hashPcapOpen = hashOpenPcap();
+      break;
+    case MODE_AP:
+      apPingCount=0; apLastPing=0; apLastDraw=0; apUdpStarted=false;
+      WiFi.mode(WIFI_AP);
+      esp_wifi_set_ps(WIFI_PS_NONE);
+      WiFi.softAP(AP_SSID, AP_PASS);
+      { wifi_config_t ap_cfg={};
+        esp_wifi_get_config(WIFI_IF_AP, &ap_cfg);
+        ap_cfg.ap.beacon_interval=40;
+        esp_wifi_set_config(WIFI_IF_AP, &ap_cfg); }
+      esp_wifi_set_inactive_time(WIFI_IF_AP, 300);
+      esp_wifi_set_ps(WIFI_PS_NONE);
+      apUdp.begin(AP_PORT); apUdpStarted=true;
+      Serial.printf("[AP] SSID=%s  IP=%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+      sdLog("AP","soft-AP started SSID=" AP_SSID);
+      break;
+    case MODE_PRESENCE:
+      portENTER_CRITICAL(&csiMux);
+      csiWinHead=0; csiWinFull=false;
+      memset((void*)csiWin,0,sizeof(csiWin));
+      csiLastRSSI=0; csiUpdated=false; csiFrameSec=0;
+      portEXIT_CRITICAL(&csiMux);
+      csiVariance=0; csiConfidence=0; csiVarBaseline=0;
+      csiCalibrated=false; csiFrameRate=0;
+      memset(csiHistBuf,0,sizeof(csiHistBuf));
+      csiHistHead=0; csiHistFull=false; csiLastSec=0;
+      presState=PRES_CONNECTING; presConnStart=millis(); presLastDraw=0;
+      WiFi.begin(AP_SSID, AP_PASS);
+      xTaskCreate(psKillerTask,"ps_killer",2048,NULL,6,&psKillerHandle);
+      Serial.printf("[PRES] Connecting to %s...\n", AP_SSID);
       break;
   }
 }
@@ -744,7 +1092,294 @@ static void renderShady() {
   if (sc_shadyScroll+SHADY_VISIBLE<shadyNetCount){ gfx->setTextColor(COL_DIM); gfx->setCursor(SCREEN_W-10,BODY_Y+BODY_H-12); gfx->print("v"); }
 }
 
-// ─── Full redraw ─────────────────────────────────────────────────────────────
+// ─── HASH renderer ───────────────────────────────────────────────────────────
+// Faithfully ports Hash Monster display layout (minus the monster sprite):
+//
+//  y=20-115  [units|  packets/sec bar chart (green), 95px tall        ]
+//  y=117-197 [         RSSI(yellow)/EAPOL(green)/deauth(red) dot graph  |units2]
+//  y=198-212 [footer: last SSID + rssi + mac  |  last EAPOL SSID + mac  ]
+//
+// Layout constants (mirrored from Hash Monster geometry, adapted to CYD body):
+#define H_UNITS1_W   36   // left units strip for bar chart
+#define H_BAR_X      36   // bar chart start x
+#define H_BAR_W     284   // bar chart width  (H_BAR_X .. 319)
+#define H_BAR_Y      20   // bar chart top y  (= BODY_Y)
+#define H_BAR_H      95   // bar chart height
+#define H_DOT_Y     117   // dot chart top y
+#define H_DOT_H      80   // dot chart height
+#define H_UNITS2_W   40   // right units strip for dot chart
+#define H_DOT_W     280   // dot chart width  (0 .. H_DOT_W-1)
+#define H_FOOT_Y    198   // status footer y  (within body)
+#define H_FOOT_H     14   // status footer height
+
+static void renderHash() {
+  gfx->fillRect(0, BODY_Y, SCREEN_W, BODY_H, COL_BG);
+
+  // ── Header ──────────────────────────────────────────────────────────────────
+  char hdr[56];
+  snprintf(hdr, sizeof(hdr), "CH:%02d AP:%d Pk:%lu E/D:%d/%d SD:%s",
+           sc_hashChan, hashAPCount, (unsigned long)hashPktsBuf[(hashHistHead+HASH_HIST_W-1)%HASH_HIST_W],
+           hashEapolTotal, hashDeauthCount, hashPcapOpen ? "On" : "Off");
+  drawHeader(hdr);
+
+  // ── Bar chart: packets/sec (graph1 equivalent) ───────────────────────────────
+  // Find max value over the history window for scaling
+  uint32_t maxPkt = 1;
+  int histLen = hashHistFull ? HASH_HIST_W : hashHistHead;
+  for (int i = 0; i < histLen; i++) { if (hashPktsBuf[i] > maxPkt) maxPkt = hashPktsBuf[i]; }
+
+  // Round max up to nearest 10 for cleaner scale
+  uint32_t scaledMax = ((maxPkt / 10) + 1) * 10;
+  float mult = (float)H_BAR_H / (float)scaledMax;
+
+  // Units strip (scale labels, right-aligned in 36px column)
+  gfx->setTextSize(1); gfx->setTextColor(COL_DIM);
+  for (int s = 0; s <= 4; s++) {
+    int val = (scaledMax * s) / 4;
+    int y   = H_BAR_Y + H_BAR_H - (int)(val * mult) - 6;
+    char buf[8]; snprintf(buf, sizeof(buf), "%4d", val);
+    gfx->setCursor(0, y); gfx->print(buf);
+  }
+
+  // Draw bars oldest→newest left→right
+  for (int col = 0; col < H_BAR_W; col++) {
+    int histIdx;
+    if (hashHistFull) {
+      histIdx = (hashHistHead + col - H_BAR_W + HASH_HIST_W) % HASH_HIST_W;
+    } else {
+      int offset = col - (H_BAR_W - hashHistHead);
+      if (offset < 0) { continue; } // no data yet for this column
+      histIdx = offset;
+    }
+    int barH = (int)(hashPktsBuf[histIdx] * mult);
+    barH = constrain(barH, 0, H_BAR_H);
+    int bx = H_BAR_X + col;
+    // Erase column
+    gfx->drawFastVLine(bx, H_BAR_Y, H_BAR_H, COL_BG);
+    // Draw bar (green)
+    if (barH > 0) gfx->drawFastVLine(bx, H_BAR_Y + H_BAR_H - barH, barH, COL_GREEN);
+  }
+  gfx->drawFastHLine(0, H_BAR_Y + H_BAR_H, SCREEN_W, COL_DIVIDER);
+
+  // ── Dot chart: RSSI / EAPOL / deauth (graph2 equivalent) ────────────────────
+  gfx->fillRect(0, H_DOT_Y, H_DOT_W, H_DOT_H, COL_BG);
+
+  for (int col = 0; col < H_DOT_W; col++) {
+    int histIdx;
+    if (hashHistFull) {
+      histIdx = (hashHistHead + col - H_DOT_W + HASH_HIST_W) % HASH_HIST_W;
+    } else {
+      int offset = col - (H_DOT_W - hashHistHead);
+      if (offset < 0) { continue; }
+      histIdx = offset;
+    }
+    int cx = col;
+
+    // Vertical grid every 10 pixels (navy/dim)
+    if ((H_DOT_W - 1 - col) % 10 == 0) {
+      gfx->drawFastVLine(cx, H_DOT_Y, H_DOT_H, 0x000F); // dim navy
+    }
+
+    // RSSI dot (yellow): map -100..-30 → top..bottom of H_DOT_H
+    int8_t rssi = hashRssiBuf[histIdx];
+    if (rssi < 0) {
+      int ry = constrain((-rssi - 30) * H_DOT_H / 70, 0, H_DOT_H - 2);
+      gfx->drawPixel(cx, H_DOT_Y + ry, COL_YELLOW);
+      gfx->drawPixel(cx, H_DOT_Y + ry + 1, COL_YELLOW);
+    }
+
+    // EAPOL dot (green): from bottom
+    uint8_t ep = hashEapolBuf[histIdx];
+    if (ep > 0) {
+      int ey = constrain((int)ep, 1, H_DOT_H);
+      gfx->drawPixel(cx, H_DOT_Y + H_DOT_H - ey,     COL_GREEN);
+      gfx->drawPixel(cx, H_DOT_Y + H_DOT_H - ey + 1, COL_GREEN);
+    }
+
+    // Deauth dot (red): from bottom
+    uint8_t da = hashDeauthBuf[histIdx];
+    if (da > 0) {
+      int dy = constrain((int)da, 1, H_DOT_H);
+      gfx->drawPixel(cx, H_DOT_Y + H_DOT_H - dy,     COL_RED);
+      gfx->drawPixel(cx, H_DOT_Y + H_DOT_H - dy + 1, COL_RED);
+    }
+  }
+
+  // Units2 strip (right side of dot chart)
+  gfx->fillRect(H_DOT_W, H_DOT_Y, H_UNITS2_W, H_DOT_H, COL_BG);
+  gfx->setTextSize(1);
+  // RSSI
+  gfx->setTextColor(COL_YELLOW);
+  gfx->setCursor(H_DOT_W + 1, H_DOT_Y + 2);
+  gfx->printf("%4d", (int)hashLastRSSI);
+  // Total EAPOL
+  gfx->setTextColor(COL_GREEN);
+  gfx->setCursor(H_DOT_W + 1, H_DOT_Y + 18);
+  gfx->printf("%4d", hashEapolTotal);
+  // Total deauth
+  gfx->setTextColor(COL_RED);
+  gfx->setCursor(H_DOT_W + 1, H_DOT_Y + 34);
+  gfx->printf("%4d", hashDeauthCount);
+  // AP count
+  gfx->setTextColor(COL_WHITE);
+  gfx->setCursor(H_DOT_W + 1, H_DOT_Y + 50);
+  gfx->printf("%4d", hashAPCount);
+
+  // ── Status footer (last SSID + last EAPOL) ───────────────────────────────────
+  gfx->fillRect(0, H_FOOT_Y, SCREEN_W, H_FOOT_H, 0x00C0);
+  gfx->setTextSize(1);
+  // Last beacon: SSID rssi mac
+  char foot1[48];
+  snprintf(foot1, sizeof(foot1), "%-14.14s %4d %s", hashLastSSID, (int)hashLastRSSI, hashLastSSIDMac);
+  gfx->setTextColor(COL_DIM); gfx->setCursor(2, H_FOOT_Y + 3); gfx->print(foot1);
+  // Last EAPOL: SSID mac  (on same line, right half)
+  char foot2[40];
+  snprintf(foot2, sizeof(foot2), " %-12.12s %s", hashLastEapolSSID, hashLastEapolMac);
+  gfx->setTextColor(COL_GREEN); gfx->setCursor(162, H_FOOT_Y + 3); gfx->print(foot2);
+
+  gfx->drawFastHLine(0, H_FOOT_Y + H_FOOT_H, SCREEN_W, COL_DIVIDER);
+}
+
+// ─── AP renderer ─────────────────────────────────────────────────────────────
+static void renderAP() {
+  gfx->fillRect(0, BODY_Y, SCREEN_W, BODY_H, COL_BG);
+  int clients = WiFi.softAPgetStationNum();
+  char hdr[52];
+  snprintf(hdr, sizeof(hdr), "%s  %s  clients:%d",
+           AP_SSID, WiFi.softAPIP().toString().c_str(), clients);
+  drawHeader(hdr);
+
+  gfx->setTextSize(2); gfx->setTextColor(COL_GREEN);
+  gfx->setCursor(52, BODY_Y + 10); gfx->print("AP  ACTIVE");
+
+  gfx->drawFastHLine(0, BODY_Y + 34, SCREEN_W, COL_DIVIDER);
+  gfx->setTextSize(1);
+  gfx->setTextColor(COL_DIM);  gfx->setCursor(4, BODY_Y + 42); gfx->print("SSID:");
+  gfx->setTextColor(COL_GREEN); gfx->print(" " AP_SSID);
+  gfx->setTextColor(COL_DIM);  gfx->setCursor(4, BODY_Y + 56); gfx->print("PASS:");
+  gfx->setTextColor(COL_WHITE); gfx->print(" " AP_PASS);
+  gfx->setTextColor(COL_DIM);  gfx->setCursor(4, BODY_Y + 70); gfx->print("IP:  ");
+  gfx->setTextColor(COL_CYAN);  gfx->print(" "); gfx->print(WiFi.softAPIP().toString().c_str());
+
+  gfx->drawFastHLine(0, BODY_Y + 84, SCREEN_W, COL_DIVIDER);
+  char buf[48];
+  gfx->setTextColor(COL_WHITE); gfx->setTextSize(1);
+  snprintf(buf, sizeof(buf), "Clients: %d", clients);
+  gfx->setCursor(4, BODY_Y + 92); gfx->print(buf);
+  snprintf(buf, sizeof(buf), "Pings:   %lu  (50/sec)", apPingCount);
+  gfx->setCursor(4, BODY_Y + 106); gfx->print(buf);
+  gfx->setTextColor(COL_DIM);
+  gfx->setCursor(4, BODY_Y + 120); gfx->print("Beacon:  40ms interval");
+
+  gfx->drawFastHLine(0, BODY_Y + 134, SCREEN_W, COL_DIVIDER);
+  gfx->setTextColor(COL_DIM); gfx->setTextSize(1);
+  gfx->setCursor(4, BODY_Y + 142); gfx->print("Board 1: keep this CYD in AP mode.");
+  gfx->setCursor(4, BODY_Y + 156); gfx->print("Board 2: connect to this AP,");
+  gfx->setCursor(4, BODY_Y + 170); gfx->print("         then tap [PRES] below.");
+}
+
+// ─── PRESENCE renderer ───────────────────────────────────────────────────────
+static void renderPresence() {
+  gfx->fillRect(0, BODY_Y, SCREEN_W, BODY_H, COL_BG);
+
+  // Header
+  char hdr[56];
+  if (presState == PRES_CONNECTING) {
+    unsigned long elapsed = (millis() - presConnStart) / 1000;
+    snprintf(hdr, sizeof(hdr), "connecting... %lus", elapsed);
+  } else {
+    snprintf(hdr, sizeof(hdr), "linked %ddBm  var:%.1f  %s",
+             (int)csiLastRSSI, csiVariance, csiCalibrated ? "[CAL]" : "");
+  }
+  drawHeader(hdr, presState == PRES_CONNECTING);
+
+  if (presState == PRES_CONNECTING) {
+    gfx->setTextColor(COL_DIM); gfx->setTextSize(1);
+    gfx->setCursor(16, BODY_Y + 60); gfx->print("Connecting to: " AP_SSID);
+    gfx->setCursor(16, BODY_Y + 76); gfx->print("Make sure Board 1 is in [AP] mode.");
+    gfx->setCursor(16, BODY_Y + 92); gfx->print("Retries every 15s automatically.");
+    return;
+  }
+
+  // Big PRESENT / MAYBE / CLEAR status
+  bool present = (csiConfidence >= 60);
+  bool maybe   = (csiConfidence >= 30 && csiConfidence < 60);
+  uint16_t statusCol = present ? COL_RED : (maybe ? COL_YELLOW : COL_GREEN);
+  const char* statusStr = present ? ">> PRESENT" : (maybe ? "??  MAYBE " : "--  CLEAR ");
+  gfx->setTextSize(2); gfx->setTextColor(statusCol);
+  int sw = strlen(statusStr) * 12;
+  gfx->setCursor((SCREEN_W - sw) / 2, P_STATUS_Y);
+  gfx->print(statusStr);
+
+  // Confidence bar
+  gfx->setTextSize(1); gfx->setTextColor(COL_DIM);
+  gfx->setCursor(4, P_CONF_Y + 2); gfx->print("CONF");
+  int barFill = (P_CONF_W * csiConfidence) / 100;
+  gfx->fillRect(40, P_CONF_Y, barFill, P_CONF_H, statusCol);
+  gfx->fillRect(40 + barFill, P_CONF_Y, P_CONF_W - barFill, P_CONF_H, COL_DIM);
+  char pct[8]; snprintf(pct, sizeof(pct), " %3d%%", csiConfidence);
+  gfx->setTextColor(COL_WHITE); gfx->setCursor(40 + P_CONF_W + 4, P_CONF_Y + 3);
+  gfx->print(pct);
+
+  gfx->drawFastHLine(0, P_CONF_Y + P_CONF_H + 4, SCREEN_W, COL_DIVIDER);
+
+  // CSI variance sparkline
+  float maxVar = 1.0f;
+  int histLen = csiHistFull ? CSI_HIST_W : csiHistHead;
+  for (int i = 0; i < histLen; i++) { if (csiHistBuf[i] > maxVar) maxVar = csiHistBuf[i]; }
+  float scaledMax = ((int)(maxVar / 5.0f) + 1) * 5.0f;
+  float mult = (float)P_SPARK_H / scaledMax;
+
+  // Scale labels
+  gfx->setTextSize(1); gfx->setTextColor(COL_DIM);
+  for (int s = 0; s <= 2; s++) {
+    float val = (scaledMax * s) / 2.0f;
+    int y = P_SPARK_Y + P_SPARK_H - (int)(val * mult) - 6;
+    char lbl[8]; snprintf(lbl, sizeof(lbl), "%4.0f", val);
+    gfx->setCursor(0, y); gfx->print(lbl);
+  }
+
+  // Draw bars oldest→newest left→right
+  for (int col = 0; col < P_SPARK_W; col++) {
+    int histIdx;
+    if (csiHistFull) {
+      histIdx = (csiHistHead + col - P_SPARK_W + CSI_HIST_W) % CSI_HIST_W;
+    } else {
+      int offset = col - (P_SPARK_W - csiHistHead);
+      if (offset < 0) continue;
+      histIdx = offset;
+    }
+    float v = csiHistBuf[histIdx];
+    int barH = constrain((int)(v * mult), 0, P_SPARK_H);
+    int bx = P_SPARK_X + col;
+    gfx->drawFastVLine(bx, P_SPARK_Y, P_SPARK_H, COL_BG);
+    if (barH > 0) {
+      uint16_t barCol = (v > scaledMax * 0.6f) ? COL_RED
+                      : (v > scaledMax * 0.3f)  ? COL_YELLOW : COL_GREEN;
+      gfx->drawFastVLine(bx, P_SPARK_Y + P_SPARK_H - barH, barH, barCol);
+    }
+  }
+
+  // Threshold lines on sparkline
+  float lo = csiCalibrated ? csiVarBaseline + CSI_VAR_LO : CSI_VAR_LO;
+  float hi = csiCalibrated ? csiVarBaseline + CSI_VAR_HI : CSI_VAR_HI;
+  int loY = P_SPARK_Y + P_SPARK_H - constrain((int)(lo * mult), 0, P_SPARK_H);
+  int hiY = P_SPARK_Y + P_SPARK_H - constrain((int)(hi * mult), 0, P_SPARK_H);
+  gfx->drawFastHLine(P_SPARK_X, loY, P_SPARK_W, COL_YELLOW);
+  gfx->drawFastHLine(P_SPARK_X, hiY, P_SPARK_W, COL_RED);
+
+  gfx->drawFastHLine(P_SPARK_X, P_SPARK_Y + P_SPARK_H, P_SPARK_W, COL_DIVIDER);
+
+  // Stats strip
+  gfx->setTextSize(1); gfx->setTextColor(COL_DIM);
+  char stats[64];
+  snprintf(stats, sizeof(stats), "VAR:%-6.1f RSSI:%-4d FR:%d/s",
+           csiVariance, (int)csiLastRSSI, csiFrameRate);
+  gfx->setCursor(4, P_STATS_Y); gfx->print(stats);
+  snprintf(stats, sizeof(stats), "lo:%.1f hi:%.1f %s  tap=calibrate",
+           lo, hi, csiCalibrated ? "[CAL]" : "");
+  gfx->setCursor(4, P_STATS_Y + 14); gfx->print(stats);
+}
 static void redrawAll() {
   switch (sc_mode) {
     case MODE_SCAN:    renderScan();    break;
@@ -753,6 +1388,9 @@ static void redrawAll() {
     case MODE_DEAUTH:  renderDeauth();  break;
     case MODE_BLE:     renderBLE();     break;
     case MODE_SHADY:   renderShady();   break;
+    case MODE_HASH:    renderHash();    break;
+    case MODE_AP:      renderAP();      break;
+    case MODE_PRESENCE:renderPresence();break;
   }
   drawFooter();
   sc_redraw = false;
@@ -802,6 +1440,23 @@ static void handleTouch() {
       case MODE_SHADY:
         if(upper){ if(sc_shadyScroll>0){sc_shadyScroll--;sc_redraw=true;} }
         else     { if(sc_shadyScroll+SHADY_VISIBLE<shadyNetCount){sc_shadyScroll++;sc_redraw=true;} }
+        break;
+      case MODE_HASH:
+        // Tap body to reset EAPOL capture log
+        portENTER_CRITICAL(&hashMux);
+        hashCaptureHead=0; hashCaptureCount=0;
+        hashEapolTotal=0; hashDeauthCount=0;
+        portEXIT_CRITICAL(&hashMux);
+        sc_redraw=true;
+        break;
+      case MODE_AP:
+        break; // no tap action in AP mode
+      case MODE_PRESENCE:
+        // Tap to calibrate: store current variance as empty-room baseline
+        csiVarBaseline = csiVariance;
+        csiCalibrated  = true;
+        sc_redraw = true;
+        Serial.printf("[PRES] Calibrated: baseline=%.2f\n", csiVarBaseline);
         break;
     }
   }
@@ -879,7 +1534,7 @@ void setup() {
   gfx->setTextSize(1); gfx->setTextColor(COL_DIM);
   gfx->setCursor(48,88);  gfx->print("Advanced 802.11 + BLE Scanner");
   gfx->setTextColor(COL_GREEN);
-  gfx->setCursor(4,108);  gfx->print("[ SCAN | PROBE | CHAN | DAUTH | BLE | SHADY ]");
+  gfx->setCursor(4,108);  gfx->print("[SCAN|PROBE|CHAN|DAUTH|BLE|SHADY|HASH|AP|PRES]");
   gfx->setTextColor(COL_DIM);
   gfx->setCursor(64,128); gfx->print("Serial @ 115200 baud");
   gfx->setCursor(64,140); gfx->print(sdOK ? "SD card: OK" : "SD card: none");
@@ -1021,6 +1676,152 @@ void loop() {
       } else {
         runShadyScan();
         if (shadyNetCount>0) ledFlash(true,true,false,100); // yellow = shady network
+      }
+      break;
+
+    // ── HASH ──────────────────────────────────────────────────────────────────
+    case MODE_HASH:
+      // Channel hop every HASH_HOP_MS
+      if (now - sc_hashLastHop >= HASH_HOP_MS) {
+        sc_hashChan = (sc_hashChan % 13) + 1;
+        esp_wifi_set_channel(sc_hashChan, WIFI_SECOND_CHAN_NONE);
+        sc_hashLastHop = now;
+      }
+      // Drain EAPOL packet queue to SD
+      hashFlushQueue();
+      // Every second: commit per-second stats into history ring buffers
+      if (now - sc_hashLastDraw >= 1000) {
+        sc_hashLastDraw = now;
+        // Snapshot volatile counters atomically
+        portENTER_CRITICAL(&hashMux);
+        uint32_t pktSnap    = hashTmpPktCount; hashTmpPktCount = 0;
+        int32_t  rssiSnap   = hashRssiSum;     hashRssiSum     = 0;
+        uint32_t eapolSnap  = hashEapolSec;    hashEapolSec    = 0;
+        uint32_t deauthSnap = hashDeauthSec;   hashDeauthSec   = 0;
+        portEXIT_CRITICAL(&hashMux);
+
+        int8_t rssiAvg = (pktSnap > 0) ? (int8_t)(rssiSnap / (int32_t)pktSnap) : 0;
+
+        hashPktsBuf[hashHistHead]   = pktSnap;
+        hashRssiBuf[hashHistHead]   = rssiAvg;
+        hashEapolBuf[hashHistHead]  = (uint8_t)min((uint32_t)255, eapolSnap);
+        hashDeauthBuf[hashHistHead] = (uint8_t)min((uint32_t)255, deauthSnap);
+        hashHistHead = (hashHistHead + 1) % HASH_HIST_W;
+        if (hashHistHead == 0) hashHistFull = true;
+
+        Serial.printf("[HASH] CH:%02d pkt:%lu RSSI:%d EAPOL:%d/%d D:%d AP:%d\n",
+          sc_hashChan, (unsigned long)pktSnap, (int)rssiAvg, (int)eapolSnap,
+          hashEapolTotal, hashDeauthCount, hashAPCount);
+        sc_redraw = true;
+      }
+      // Log new EAPOL captures to SD text
+      if (hashUpdated) {
+        hashUpdated = false;
+        portENTER_CRITICAL(&hashMux);
+        int idx = (hashCaptureHead - 1 + HASH_CAP_MAX) % HASH_CAP_MAX;
+        char ssid[33]; strncpy(ssid, hashCaptures[idx].ssid, 32); ssid[32]='\0';
+        char bssid[18]; strncpy(bssid, hashCaptures[idx].bssid, 17); bssid[17]='\0';
+        portEXIT_CRITICAL(&hashMux);
+        char line[64]; snprintf(line, sizeof(line), "SSID:\"%s\" BSSID:%s EAPOL#%d", ssid, bssid, hashEapolTotal);
+        Serial.printf("[HASH EAPOL] %s\n", line); sdLog("HASH", line);
+        ledFlash(false, true, false, 150);
+      }
+      break;
+
+    // ── AP ────────────────────────────────────────────────────────────────────
+    case MODE_AP:
+      if (apUdpStarted && now - apLastPing >= AP_PING_MS) {
+        apUdp.beginPacket(AP_BCAST_IP, AP_PORT);
+        apUdp.print("ping");
+        apUdp.endPacket();
+        apPingCount++;
+        apLastPing = now;
+      }
+      if (now - apLastDraw >= 2000) {
+        apLastDraw = now;
+        sc_redraw  = true;
+        Serial.printf("[AP] clients:%d  pings:%lu\n", WiFi.softAPgetStationNum(), apPingCount);
+      }
+      break;
+
+    // ── PRESENCE ──────────────────────────────────────────────────────────────
+    case MODE_PRESENCE:
+      if (presState == PRES_CONNECTING) {
+        if (WiFi.status() == WL_CONNECTED) {
+          presState = PRES_CSI_ACTIVE;
+          esp_wifi_set_ps(WIFI_PS_NONE);
+          // Enable CSI capture with all subcarrier types
+          wifi_csi_config_t cfg = {};
+          cfg.lltf_en=true; cfg.htltf_en=true; cfg.stbc_htltf2_en=true;
+          cfg.ltf_merge_en=true; cfg.channel_filter_en=true;
+          cfg.manu_scale=false; cfg.shift=0;
+          esp_wifi_set_csi_config(&cfg);
+          esp_wifi_set_csi_rx_cb(onCSI, NULL);
+          esp_wifi_set_csi(true);
+          csiLastSec = now;
+          sc_redraw = true;
+          Serial.printf("[PRES] Connected IP=%s RSSI=%d  CSI active\n",
+                        WiFi.localIP().toString().c_str(), WiFi.RSSI());
+          sdLog("PRES","CSI active SSID=" AP_SSID);
+        } else if (now - presConnStart > 15000) {
+          presConnStart = now;
+          WiFi.disconnect(); delay(100); WiFi.begin(AP_SSID, AP_PASS);
+          Serial.println("[PRES] Connection timeout, retrying...");
+        }
+        if (now - presLastDraw >= 500) { presLastDraw = now; sc_redraw = true; }
+      } else {  // PRES_CSI_ACTIVE
+        if (WiFi.status() != WL_CONNECTED) {
+          presState = PRES_CONNECTING; presConnStart = now;
+          esp_wifi_set_csi(false);
+          WiFi.begin(AP_SSID, AP_PASS);
+          Serial.println("[PRES] Connection lost, reconnecting...");
+          sc_redraw = true;
+        }
+        // Every 100ms: compute variance from rolling window
+        if (csiUpdated && now - csiLastSec >= 100) {
+          csiLastSec = now;
+          portENTER_CRITICAL(&csiMux);
+          int winN = csiWinFull ? CSI_WIN : csiWinHead;
+          float win[CSI_WIN];
+          for (int i = 0; i < winN; i++) win[i] = csiWin[i];
+          int8_t rssiSnap = csiLastRSSI;
+          uint32_t frSnap = csiFrameSec; csiFrameSec = 0;
+          csiUpdated = false;
+          portEXIT_CRITICAL(&csiMux);
+
+          if (winN > 1) {
+            float mean = 0;
+            for (int i = 0; i < winN; i++) mean += win[i];
+            mean /= winN;
+            float var = 0;
+            for (int i = 0; i < winN; i++) { float d=win[i]-mean; var+=d*d; }
+            csiVariance = var / winN;
+          }
+          csiFrameRate = frSnap * 10;  // 100ms tick → frames/sec
+
+          csiHistBuf[csiHistHead] = csiVariance;
+          csiHistHead = (csiHistHead + 1) % CSI_HIST_W;
+          if (csiHistHead == 0) csiHistFull = true;
+
+          float lo = csiCalibrated ? csiVarBaseline + CSI_VAR_LO : CSI_VAR_LO;
+          float hi = csiCalibrated ? csiVarBaseline + CSI_VAR_HI : CSI_VAR_HI;
+          if      (csiVariance < lo) csiConfidence = 0;
+          else if (csiVariance > hi) csiConfidence = 100;
+          else csiConfidence = (uint8_t)((csiVariance - lo) / (hi - lo) * 100.0f);
+
+          // LED feedback: red=present, yellow=maybe, off=clear
+          if      (csiConfidence >= 60) ledSet(true, false, false);
+          else if (csiConfidence >= 30) ledSet(true, true,  false);
+          else                          ledOff();
+
+          Serial.printf("[PRES] var:%.2f conf:%d%% rssi:%d fr:%d/s\n",
+                        csiVariance, csiConfidence, (int)rssiSnap, csiFrameRate);
+          char logline[48];
+          snprintf(logline, sizeof(logline), "var:%.2f conf:%d rssi:%d",
+                   csiVariance, csiConfidence, (int)rssiSnap);
+          sdLog("PRES", logline);
+          sc_redraw = true;
+        }
       }
       break;
   }
