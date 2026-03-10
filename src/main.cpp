@@ -455,15 +455,19 @@ static unsigned long apLastDraw   = 0;
 #define CSI_WIN      30    // rolling variance window (frames)
 #define CSI_HIST_W   284   // sparkline history depth = P_SPARK_W
 #define CSI_VAR_LO   3.0f  // variance below this → empty room
-#define CSI_VAR_HI   25.0f // variance above this → definitely present
+#define CSI_VAR_HI   6.0f  // variance above this → definitely present (tuned to observed range)
+#define CSI_CAL_DELAY_MS 6000UL  // ms countdown before empty-room calibration fires
 
 #define PRES_CONNECTING  0
 #define PRES_CSI_ACTIVE  1
 
-static uint8_t       presState      = PRES_CONNECTING;
-static unsigned long presConnStart  = 0;
-static unsigned long presLastDraw   = 0;
-static TaskHandle_t  psKillerHandle = NULL;
+static uint8_t       presState           = PRES_CONNECTING;
+static unsigned long presConnStart       = 0;
+static unsigned long presLastDraw        = 0;
+static unsigned long presLastKeepalive   = 0;
+static TaskHandle_t  psKillerHandle      = NULL;
+static WiFiUDP       presUdp;
+static bool          presUdpStarted      = false;
 static portMUX_TYPE  csiMux         = portMUX_INITIALIZER_UNLOCKED;
 
 // ISR-side rolling amplitude window (one entry per received CSI frame)
@@ -476,9 +480,12 @@ static volatile uint32_t csiFrameSec  = 0;  // frames received this 100 ms tick
 
 // Loop-side processed state
 static float    csiVariance    = 0.0f;
+static float    csiPeakVar     = 0.0f;   // highest variance seen this session
 static uint8_t  csiConfidence  = 0;      // 0-100
-static float    csiVarBaseline = 0.0f;   // calibrated empty-room offset
-static bool     csiCalibrated  = false;
+static float    csiVarBaseline    = 0.0f;   // calibrated empty-room offset
+static bool     csiCalibrated     = false;
+static bool     csiCalPending     = false;  // countdown in progress
+static unsigned long csiCalCountStart = 0;
 static uint32_t csiFrameRate   = 0;      // frames/sec (approx)
 
 // Sparkline history (loop-written, render-read)
@@ -731,6 +738,7 @@ static void enterMode(int m) {
   } else if (sc_mode == MODE_PRESENCE) {
     esp_wifi_set_csi(false);
     esp_wifi_set_csi_rx_cb(NULL, NULL);
+    if (presUdpStarted) { presUdp.stop(); presUdpStarted = false; }
     if (psKillerHandle) { vTaskDelete(psKillerHandle); psKillerHandle = NULL; }
     presState = PRES_CONNECTING;
   } else if (sc_mode >= 0) {
@@ -811,11 +819,12 @@ static void enterMode(int m) {
       memset((void*)csiWin,0,sizeof(csiWin));
       csiLastRSSI=0; csiUpdated=false; csiFrameSec=0;
       portEXIT_CRITICAL(&csiMux);
-      csiVariance=0; csiConfidence=0; csiVarBaseline=0;
-      csiCalibrated=false; csiFrameRate=0;
+      csiVariance=0; csiPeakVar=0; csiConfidence=0; csiVarBaseline=0;
+      csiCalibrated=false; csiCalPending=false; csiCalCountStart=0; csiFrameRate=0;
       memset(csiHistBuf,0,sizeof(csiHistBuf));
       csiHistHead=0; csiHistFull=false; csiLastSec=0;
-      presState=PRES_CONNECTING; presConnStart=millis(); presLastDraw=0;
+      presState=PRES_CONNECTING; presConnStart=millis(); presLastDraw=0; presLastKeepalive=0;
+      presUdpStarted=false;
       WiFi.begin(AP_SSID, AP_PASS);
       xTaskCreate(psKillerTask,"ps_killer",2048,NULL,6,&psKillerHandle);
       Serial.printf("[PRES] Connecting to %s...\n", AP_SSID);
@@ -1324,10 +1333,13 @@ static void renderPresence() {
   gfx->drawFastHLine(0, P_CONF_Y + P_CONF_H + 4, SCREEN_W, COL_DIVIDER);
 
   // CSI variance sparkline
-  float maxVar = 1.0f;
+  float lo = csiCalibrated ? csiVarBaseline + CSI_VAR_LO : CSI_VAR_LO;
+  float hi = csiCalibrated ? csiVarBaseline + CSI_VAR_HI : CSI_VAR_HI;
+  float maxVar = hi * 1.5f;  // always show at least 1.5× HI so threshold lines are visible
   int histLen = csiHistFull ? CSI_HIST_W : csiHistHead;
   for (int i = 0; i < histLen; i++) { if (csiHistBuf[i] > maxVar) maxVar = csiHistBuf[i]; }
   float scaledMax = ((int)(maxVar / 5.0f) + 1) * 5.0f;
+  if (scaledMax < hi * 1.5f) scaledMax = hi * 1.5f;  // never shrink below threshold range
   float mult = (float)P_SPARK_H / scaledMax;
 
   // Scale labels
@@ -1361,8 +1373,6 @@ static void renderPresence() {
   }
 
   // Threshold lines on sparkline
-  float lo = csiCalibrated ? csiVarBaseline + CSI_VAR_LO : CSI_VAR_LO;
-  float hi = csiCalibrated ? csiVarBaseline + CSI_VAR_HI : CSI_VAR_HI;
   int loY = P_SPARK_Y + P_SPARK_H - constrain((int)(lo * mult), 0, P_SPARK_H);
   int hiY = P_SPARK_Y + P_SPARK_H - constrain((int)(hi * mult), 0, P_SPARK_H);
   gfx->drawFastHLine(P_SPARK_X, loY, P_SPARK_W, COL_YELLOW);
@@ -1370,15 +1380,30 @@ static void renderPresence() {
 
   gfx->drawFastHLine(P_SPARK_X, P_SPARK_Y + P_SPARK_H, P_SPARK_W, COL_DIVIDER);
 
-  // Stats strip
+  // Stats strip — two rows of debug data
   gfx->setTextSize(1); gfx->setTextColor(COL_DIM);
   char stats[64];
-  snprintf(stats, sizeof(stats), "VAR:%-6.1f RSSI:%-4d FR:%d/s",
-           csiVariance, (int)csiLastRSSI, csiFrameRate);
+  // Row 1: live signal data + peak tracker
+  snprintf(stats, sizeof(stats), "VAR:%-5.1f PK:%-5.1f FR:%d/s RSSI:%d",
+           csiVariance, csiPeakVar, csiFrameRate, (int)csiLastRSSI);
   gfx->setCursor(4, P_STATS_Y); gfx->print(stats);
-  snprintf(stats, sizeof(stats), "lo:%.1f hi:%.1f %s  tap=calibrate",
-           lo, hi, csiCalibrated ? "[CAL]" : "");
-  gfx->setCursor(4, P_STATS_Y + 14); gfx->print(stats);
+  // Row 2: threshold info / countdown / calibration status
+  if (csiCalPending) {
+    int secsLeft = (int)((CSI_CAL_DELAY_MS - (millis() - csiCalCountStart)) / 1000) + 1;
+    secsLeft = constrain(secsLeft, 0, 6);
+    gfx->setTextColor(COL_YELLOW);
+    snprintf(stats, sizeof(stats), "LEAVE ROOM — calibrating in %ds...", secsLeft);
+    gfx->setCursor(4, P_STATS_Y + 14); gfx->print(stats);
+  } else if (csiCalibrated) {
+    gfx->setTextColor(COL_GREEN);
+    snprintf(stats, sizeof(stats), "CAL base:%.1f lo:%.1f hi:%.1f  tap=reset",
+             csiVarBaseline, lo, hi);
+    gfx->setCursor(4, P_STATS_Y + 14); gfx->print(stats);
+  } else {
+    snprintf(stats, sizeof(stats), "UNCAL lo:%.1f hi:%.1f  tap=calibrate",
+             lo, hi);
+    gfx->setCursor(4, P_STATS_Y + 14); gfx->print(stats);
+  }
 }
 static void redrawAll() {
   switch (sc_mode) {
@@ -1452,11 +1477,20 @@ static void handleTouch() {
       case MODE_AP:
         break; // no tap action in AP mode
       case MODE_PRESENCE:
-        // Tap to calibrate: store current variance as empty-room baseline
-        csiVarBaseline = csiVariance;
-        csiCalibrated  = true;
-        sc_redraw = true;
-        Serial.printf("[PRES] Calibrated: baseline=%.2f\n", csiVarBaseline);
+        if (csiCalibrated) {
+          // Second tap resets bad calibration back to uncalibrated state
+          csiCalibrated    = false;
+          csiVarBaseline   = 0.0f;
+          csiCalPending    = false;
+          sc_redraw        = true;
+          Serial.println("[PRES] Calibration reset");
+        } else if (!csiCalPending) {
+          // First tap: start 6-second countdown — user leaves signal path
+          csiCalPending      = true;
+          csiCalCountStart   = millis();
+          sc_redraw          = true;
+          Serial.println("[PRES] Calibration countdown started — leave the room!");
+        }
         break;
     }
   }
@@ -1750,6 +1784,10 @@ void loop() {
         if (WiFi.status() == WL_CONNECTED) {
           presState = PRES_CSI_ACTIVE;
           esp_wifi_set_ps(WIFI_PS_NONE);
+          // Start keepalive UDP — sends unicast to AP so 802.11 ACKs flow back,
+          // which is what actually triggers CSI callbacks on the STA side.
+          presUdp.begin(AP_PORT); presUdpStarted = true;
+          presLastKeepalive = now;
           // Enable CSI capture with all subcarrier types
           wifi_csi_config_t cfg = {};
           cfg.lltf_en=true; cfg.htltf_en=true; cfg.stbc_htltf2_en=true;
@@ -1773,9 +1811,26 @@ void loop() {
         if (WiFi.status() != WL_CONNECTED) {
           presState = PRES_CONNECTING; presConnStart = now;
           esp_wifi_set_csi(false);
+          if (presUdpStarted) { presUdp.stop(); presUdpStarted = false; }
           WiFi.begin(AP_SSID, AP_PASS);
           Serial.println("[PRES] Connection lost, reconnecting...");
           sc_redraw = true;
+        }
+        // Keepalive: send unicast UDP to AP every 50ms → AP sends 802.11 ACKs → CSI fires
+        if (presUdpStarted && now - presLastKeepalive >= 50) {
+          presLastKeepalive = now;
+          presUdp.beginPacket("192.168.4.1", AP_PORT);
+          presUdp.print("ka");
+          presUdp.endPacket();
+        }
+        // Calibration countdown: fire after CSI_CAL_DELAY_MS with room empty
+        if (csiCalPending && now - csiCalCountStart >= CSI_CAL_DELAY_MS) {
+          csiCalPending    = false;
+          csiVarBaseline   = csiVariance;
+          csiCalibrated    = true;
+          sc_redraw        = true;
+          Serial.printf("[PRES] Calibrated: baseline=%.2f\n", csiVarBaseline);
+          ledSet(false, true, false); delay(150); ledOff(); // green flash = calibrated
         }
         // Every 100ms: compute variance from rolling window
         if (csiUpdated && now - csiLastSec >= 100) {
@@ -1796,6 +1851,7 @@ void loop() {
             float var = 0;
             for (int i = 0; i < winN; i++) { float d=win[i]-mean; var+=d*d; }
             csiVariance = var / winN;
+            if (csiVariance > csiPeakVar) csiPeakVar = csiVariance;
           }
           csiFrameRate = frSnap * 10;  // 100ms tick → frames/sec
 
@@ -1822,6 +1878,8 @@ void loop() {
           sdLog("PRES", logline);
           sc_redraw = true;
         }
+        // Force redraw every 500ms even if no new CSI data (keeps display feeling live)
+        if (now - presLastDraw >= 500) { presLastDraw = now; sc_redraw = true; }
       }
       break;
   }

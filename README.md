@@ -1,6 +1,6 @@
 # CYD Advanced WiFi & BLE Scanner
 
-A feature-rich wireless security scanner and sniffer for the **ESP32-2432S028R (CYD — Cheap Yellow Display)**. Born from the fusion of two prior projects, rebuilt and expanded into a clean hacker-terminal UI with six independent scanning modes.
+A feature-rich wireless security scanner, sniffer, and human presence detector for the **ESP32-2432S028R (CYD — Cheap Yellow Display)**. Nine independent scanning modes accessible from a touch footer bar, including a two-device WiFi CSI-based presence detection system.
 
 > **Hardware:** ESP32-2432S028R · ILI9341 320×240 touchscreen · XPT2046 touch · RGB LED · SD card (optional)
 
@@ -16,15 +16,28 @@ A feature-rich wireless security scanner and sniffer for the **ESP32-2432S028R (
 
 ---
 
+## Two Firmware Builds
+
+This repo contains **two separate firmware builds** — functionally identical, differing only in display hardware:
+
+| Folder | Board | Display |
+|--------|-------|---------|
+| `src/` | Standard CYD (ESP32-2432S028R) | Normal color polarity |
+| `InvertedCYDWifiScanner/` | Inverted CYD variant | `invertDisplay(true)` applied |
+
+Flash the correct one for your board. If colors look wrong (white appears black, green appears magenta), use the inverted build.
+
+---
+
 ## Modes
 
-All six modes are accessible from the touch footer bar at the bottom of the screen. Tap any label to switch instantly.
+All nine modes are accessible from the touch footer bar at the bottom of the screen. Tap any label to switch instantly.
 
 ### `[SCAN]` — WiFi Network Scanner
-Async WiFi scan with compact AntiPMatrix-style display. Results persist on screen during rescans — no more blank flicker.
+Async WiFi scan with compact terminal-style display. Results persist on screen during rescans — no blank flicker.
 
 - Up to 40 networks displayed, sorted by signal strength (strongest first)
-- Continuous color-coded signal bar per network: **green** (strong) · **yellow** (medium) · **red** (weak)
+- Color-coded signal bar per network: **green** (strong) · **yellow** (medium) · **red** (weak)
 - Shows: SSID · lock icon · signal bar · dBm · channel · encryption type (WPA2/WPA3/WPA+/OPEN)
 - Hidden networks deduplicated by BSSID and sorted to the bottom, labeled `[Hidden]`
 - Header shows live count: `15 nets (0 hidden)` with `↻` spinner during active scan
@@ -60,39 +73,106 @@ Monitors for 802.11 deauthentication and disassociation frames — the hallmark 
 Non-blocking BLE device discovery running on a dedicated FreeRTOS task.
 
 - Detects nearby BLE devices with MAC address, name, and RSSI
-- **Skimmer hunter**: flags devices matching known ATM/POS skimmer MAC prefixes
+- **Skimmer hunter**: flags devices matching known ATM/POS skimmer MAC prefixes and names
 - **Threat detection**: unknown/unnamed devices at strong signal flagged as suspicious
 - RGB LED pulses **blue** when scanning
-- Shows: device name (or `<unnamed>`) · BSSID · RSSI · threat flag
+- Shows: device name (or `<unnamed>`) · MAC · RSSI · threat flag
 
 ### `[SHADY]` — Suspicious Network Analyzer
 Scans for WiFi networks with behavioral red flags — rogue APs, PineAP pineapples, and evil twins.
 
-- Suspicion scoring system: **OPEN** network · **HIDDEN** SSID · **STRONG** signal (possible nearby AP) · **BEACON SPAM** (special characters in SSID)
+- Suspicion scoring: **OPEN** network · **HIDDEN** SSID · **STRONG** signal · **BEACON SPAM** (special chars in SSID)
 - **PineAP detection**: tracks BSSIDs broadcasting multiple different SSIDs (≥3 = flagged)
 - Results sorted by suspicion score descending
 - RGB LED flashes **yellow** when shady networks are found
+
+### `[HASH]` — WPA Handshake & EAPOL Sniffer
+Promiscuous capture of WPA2 handshake (EAPOL) frames with PCAP file output.
+
+- Tracks beacons (AP MAC → SSID mapping) and EAPOL frames in real time
+- Dual live graphs: packets/sec bar chart + RSSI/EAPOL/deauth dot graph
+- Saves captured frames to SD card as standard libpcap files (`/hash{timestamp}.pcap`) — open in Wireshark
+- Channel hops across all 13 channels every 500ms
+- Footer shows last beacon SSID/MAC and last EAPOL SSID/MAC
+
+### `[AP]` — CSI Ping Access Point *(Board 1)*
+Turns this CYD into a soft access point that broadcasts WiFi packets for CSI-based presence detection.
+
+- Creates AP: **SSID:** `CYD_CSI` · **Password:** `cydscanner123`
+- Sends UDP broadcast pings at 50/sec (20ms interval) to keep CSI frame delivery flowing
+- 40ms beacon interval for maximum CSI trigger frequency
+- Shows connected client count and ping counter
+- Used together with a second CYD running `[PRES]` mode
+
+### `[PRES]` — Human Presence Detector *(Board 2)*
+Connects to a `[AP]`-mode CYD and uses **WiFi Channel State Information (CSI)** variance to detect human presence.
+
+- Measures how a human body disturbs the WiFi signal between the two devices
+- Rolling 30-frame variance window updated every 100ms
+- Three detection states: **`-- CLEAR`** · **`?? MAYBE`** · **`>> PRESENT`**
+- Confidence bar (0–100%) with color coding
+- CSI variance sparkline with threshold lines always visible
+- Peak variance tracker (`PK:`) to help tune detection thresholds
+- **Tap to calibrate**: 6-second countdown — tap, walk out of signal path, green LED flash = done
+- **Tap again** to reset a bad calibration
+- RGB LED: **red** = present · **yellow** = maybe · **off** = clear
+- Logs presence events to SD card
+
+---
+
+## Presence Detection Setup
+
+The `[AP]` + `[PRES]` modes work as a two-device system. **Both CYDs run the same firmware** — just select the mode you want.
+
+### How it works
+The AP device sends constant WiFi packets. A human body absorbs and reflects 2.4GHz WiFi significantly — the PRES device measures how the received signal changes (CSI variance) and infers whether someone is in the signal path.
+
+> **Important:** This detects **movement**, not static presence. Someone sitting perfectly still will eventually read as CLEAR. Walking through the signal path reliably triggers detection.
+
+### Placement
+- Put the two devices **on opposite sides** of the area you want to monitor, facing each other
+- **3–15 feet apart** is the sweet spot
+- Line of sight is ideal but not required — works through walls with reduced sensitivity
+- Avoid placement near metal, fish tanks, microwaves, or anything that moves on its own
+- For whole-home coverage in a small space: AP in center, multiple PRES devices around the perimeter
+
+### Calibration
+1. Let the PRES device connect and wait for `FR` to stabilize (~10–20/s)
+2. **Tap the screen** — display shows `LEAVE ROOM — calibrating in 6s...`
+3. Step out of the signal path (or to the side) during the countdown
+4. Green LED flash = calibration complete — the empty-room baseline is now set
+5. Walk back through the signal path — confidence should rise
+6. **Tap again** at any time to reset a bad calibration and start over
+
+### Tuning
+The detection thresholds are defined at the top of `main.cpp`:
+
+```cpp
+#define CSI_VAR_LO   3.0f  // variance below this → empty room (0% confidence)
+#define CSI_VAR_HI   6.0f  // variance above this → definitely present (100% confidence)
+```
+
+Watch the `PK:` (peak variance) value on the PRES display while moving around. Set `CSI_VAR_HI` to roughly your observed peak. Set `CSI_VAR_LO` to the idle variance when the room is empty.
 
 ---
 
 ## UI Layout
 
 ```
-┌──────────────────────────────────────┐
-│  [MODE]  •  status / count / info    │  ← Header (20px)
-├──────────────────────────────────────┤
-│                                      │
-│           mode content               │  ← Body (200px)
-│                                      │
-├──────────────────────────────────────┤
-│  SCAN │ PROBE │ CHAN │DAUTH│ BLE │SHADY│  ← Footer touch bar (20px)
-└──────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│  [MODE]  •  status / count / info            │  ← Header (20px)
+├──────────────────────────────────────────────┤
+│                                              │
+│              mode content                    │  ← Body
+│                                              │
+├──────────────────────────────────────────────┤
+│ SCAN│PROBE│CHAN│DAUTH│BLE│SHADY│HASH│AP│PRES │  ← Footer touch bar
+└──────────────────────────────────────────────┘
 ```
 
 - **Green-on-black** hacker terminal theme throughout
 - Active mode tab highlighted with white text
-- `•` live indicator in header pulses during active scanning
-- RGB LED (active LOW): red=deauth alert · blue=BLE · yellow=shady · green=touch feedback
+- RGB LED (active LOW): red=deauth/present · blue=BLE · yellow=shady/maybe · green=calibration done
 
 ---
 
@@ -123,15 +203,19 @@ Scans for WiFi networks with behavioral red flags — rogue APs, PineAP pineappl
 
 ## SD Card Logging
 
-If an SD card is present (FAT32 formatted), all scan events are appended to `/cydscan.txt` with mode-prefixed entries:
+If an SD card is present (FAT32 formatted), all scan events are appended to `/cydscan.txt`:
 
 ```
-[SCAN] SSID:"PsyClock                  " CH:01 RSSI:-30  WPA2 b4:fb:e4:xx:xx:xx
+[SCAN] SSID:"PsyClock" CH:01 RSSI:-30  WPA2 b4:fb:e4:xx:xx:xx
 [PROBE] MAC:AA:BB:CC:DD:EE:FF SSID:"MyHomeNetwork"
 [DEAUTH] BSSID:AA:BB:CC:DD:EE:FF rate:8.3/s total:25
 [BLE] NAME:HC-08 MAC:aa:bb:cc:dd:ee:ff RSSI:-55 SKIMMER
 [SHADY] SSID:"FreeWiFi" score:3 flags:OPEN,STRONG,HIDDEN
+[HASH EAPOL] SSID:"HomeNet" BSSID:XX:XX:XX:XX:XX:XX EAPOL#15
+[PRES] var:4.50 conf:50 rssi:-53
 ```
+
+HASH mode also saves PCAP files (`/hash{timestamp}.pcap`) openable in Wireshark.
 
 SD card is optional — the scanner runs fully without one.
 
@@ -142,13 +226,15 @@ SD card is optional — the scanner runs fully without one.
 **Requirements:** PlatformIO (VS Code extension or CLI)
 
 ```bash
-# Clone and enter project
+# Build standard firmware
 cd CYDWiFiScanner
-
-# Build
 pio run
 
 # Flash (CYD connected via USB)
+pio run --target upload
+
+# Build inverted display firmware
+cd InvertedCYDWifiScanner
 pio run --target upload
 
 # Monitor serial output (115200 baud)
@@ -160,46 +246,37 @@ pio device monitor
 - `board_build.f_cpu = 240000000L` — full 240MHz for responsive UI
 - BLE enabled via `-DCONFIG_BT_ENABLED=1 -DCONFIG_BLUEDROID_ENABLED=1`
 
+---
+
 ## Known Issues & Notes
 
 ### ⚠️ First Boot: Switch Away from SCAN Before Using It
-On first flash or cold boot, **tap any other mode first** (e.g. PROBE, CHAN) and then return to SCAN. Going straight into SCAN immediately after boot can cause a crash/reboot. This is a known quirk of the WiFi stack initialization timing — harmless, and a fix may come in a future update.
+On first flash or cold boot, **tap any other mode first** (e.g. PROBE, CHAN) and then return to SCAN. Going straight into SCAN immediately after boot can cause a crash/reboot. This is a known quirk of the WiFi stack initialization timing — harmless.
 
----
-
-## Inverted Display Version (`InvertedCYDWifiScanner/`)
-
-An identical copy of this project exists in `InvertedCYDWifiScanner/` for CYD boards that ship with the ILI9341 display wired with inverted color polarity. The **only difference** is one line added to setup:
-
-```cpp
-gfx->invertDisplay(true);
-```
-
-This corrects the hardware-level color inversion at the display controller. **Expect the colors to look different from the original** — the green-on-black theme will shift to different hues depending on the specific panel. This is normal for inverted conversions; the UI layout and all functionality remain identical.
+### ⚠️ PRES Mode: RSSI -81 or Lower
+If RSSI on the PRES device is below -70, move the two devices closer together. Weak signal degrades CSI quality and reduces detection sensitivity. Target -40 to -60 dBm for best results.
 
 ---
 
 ## External IPEX Antenna Mod (CYD)
 
-This CYD board ships with the RF path set to the onboard PCB antenna.  
-To use the IPEX (u.FL) connector, **move the 0Ω RF selector resistor** from the PCB-antenna pad to the IPEX pad, which switches the antenna path to the external connector.
+This CYD board ships with the RF path set to the onboard PCB antenna.
+To use the IPEX (u.FL) connector, **move the 0Ω RF selector resistor** from the PCB-antenna pad to the IPEX pad.
 
 > ⚠️ Only one antenna path should be connected at a time — do not bridge both pads.
 
-An external antenna improves WiFi and BLE scan range significantly, which directly benefits all modes in this scanner.
+An external antenna improves WiFi and BLE scan range significantly, which directly benefits all modes including presence detection.
 
 ---
 
-
-
-This project is a fusion of two prior builds:
+## Project History
 
 | Version | Description |
 |---------|-------------|
-| **Jan 2026** (`OriginalPredDetectorJan2026/`) | Original ESP32-2432S028 WiFi/BLE Predator Detection — BLE skimmer hunter, shady WiFi analyzer, PineAP detection |
-| **Mar 2026** (current `src/`) | Full rewrite merging both projects: 6-mode scanner, AntiPMatrix-style SCAN display, fixed async scan engine, SD logging, RGB LED, touch UI |
+| **Jan 2026** (`OriginalPredDetectorJan2026/`) | Original ESP32-2432S028 predator detection — BLE skimmer hunter, shady WiFi analyzer, PineAP detection |
+| **Mar 2026** (current `src/`) | Full rewrite: 9-mode scanner, WPA handshake capture, PCAP logging, WiFi CSI presence detection (AP + PRES modes), calibration countdown, inverted display variant |
 
-The `OriginalPredDetectorJan2026/` folder is preserved in this repo as the pre-merge reference.
+The `OriginalPredDetectorJan2026/` folder is preserved as the pre-merge reference.
 
 ---
 
