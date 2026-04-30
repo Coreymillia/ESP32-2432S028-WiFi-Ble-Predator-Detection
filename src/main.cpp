@@ -25,6 +25,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_bt.h>
 #include <esp_wifi.h>
 #include <Arduino_GFX_Library.h>
 #include <XPT2046_Touchscreen.h>
@@ -34,6 +35,7 @@
 #include <SD.h>
 #include <FS.h>
 #include <WiFiUdp.h>
+#include "WeatherRadar.h"
 
 // ─── Display — CYD ILI9341 320×240 landscape ────────────────────────────────
 #define GFX_BL 21
@@ -86,7 +88,7 @@ static void sdLog(const char* tag, const char* msg) {
 #define BODY_Y      HEADER_H
 #define BODY_H      192
 #define FOOTER_Y    212
-#define NUM_MODES     9
+#define SCANNER_MODE_COUNT 9
 
 // ─── Colors ─────────────────────────────────────────────────────────────────
 #define COL_BG        0x0000
@@ -112,11 +114,14 @@ static void sdLog(const char* tag, const char* msg) {
 #define MODE_HASH    6
 #define MODE_AP      7
 #define MODE_PRESENCE 8
-static const char* MODE_NAMES[NUM_MODES] = {"SCAN","PROBE","CHAN","DAUTH","BLE","SHADY","HASH","AP","PRES"};
+#define MODE_WEATHER 9
+static const char* MODE_NAMES[SCANNER_MODE_COUNT] = {"SCAN","PROBE","CHAN","DAUTH","BLE","SHADY","HASH","AP","PRES"};
 
 // ─── App state ───────────────────────────────────────────────────────────────
 static int  sc_mode   = -1;
 static bool sc_redraw = true;
+static int  sc_lastScannerMode = MODE_SCAN;
+static bool sc_btMemReleasedUntilReboot = false;
 
 // ─── SCAN state ──────────────────────────────────────────────────────────────
 // Layout (AntiPMatrix-style compact rows):
@@ -310,6 +315,7 @@ static void bleScanTask(void* param) {
     delay(500);
   }
   s->stop();
+  bleScanTaskHandle = NULL;
   vTaskDelete(NULL);
 }
 
@@ -755,8 +761,72 @@ static void enablePromisc(bool all) {
   esp_wifi_set_promiscuous(true);
 }
 
+static void releaseBTMemoryUntilReboot() {
+  if (sc_btMemReleasedUntilReboot) return;
+
+  esp_bt_controller_status_t btStatus = esp_bt_controller_get_status();
+  if (btStatus != ESP_BT_CONTROLLER_STATUS_IDLE) {
+    Serial.printf("[BLE] BT controller not idle (%d), cannot release memory\n", (int)btStatus);
+    return;
+  }
+
+  esp_err_t err = esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+  if (err == ESP_OK) {
+    sc_btMemReleasedUntilReboot = true;
+    if (sc_lastScannerMode == MODE_BLE) sc_lastScannerMode = MODE_SCAN;
+    Serial.println("[BLE] Bluetooth memory released until reboot for RADAR");
+    sdLog("BLE", "Bluetooth memory released until reboot for RADAR");
+  } else {
+    Serial.printf("[BLE] BT memory release failed: %d\n", (int)err);
+  }
+}
+
+static void shutdownWirelessSubsystems(bool fullReset) {
+  WiFi.scanDelete();
+  sc_scanRunning = false;
+  sc_shadyRunning = false;
+
+  esp_wifi_set_promiscuous(false);
+
+  if (bleScanActive) {
+    bleScanActive = false;
+    unsigned long waitStart = millis();
+    while (bleScanTaskHandle && millis() - waitStart < 4000UL) {
+      delay(20);
+    }
+  }
+  if (bleInitialized && fullReset) {
+    BLEDevice::deinit(true);
+    bleInitialized = false;
+    bleScanTaskHandle = NULL;
+  }
+
+  if (apTcpHandle) {
+    vTaskDelete(apTcpHandle);
+    apTcpHandle = NULL;
+  }
+  if (apUdpStarted) {
+    apUdp.stop();
+    apUdpStarted = false;
+  }
+  if (presUdpStarted) {
+    presUdp.stop();
+    presUdpStarted = false;
+  }
+
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  if (fullReset) releaseBTMemoryUntilReboot();
+  delay(fullReset ? 250 : 50);
+}
+
 static void enterMode(int m) {
   if (m == sc_mode) return;
+  if (m == MODE_BLE && sc_btMemReleasedUntilReboot) {
+    Serial.println("[BLE] Mode unavailable until reboot");
+    return;
+  }
   // Cleanup
   if (sc_mode == MODE_SCAN || sc_mode == MODE_SHADY) {
     WiFi.scanDelete(); sc_scanRunning = false; sc_shadyRunning = false;
@@ -772,11 +842,21 @@ static void enterMode(int m) {
   } else if (sc_mode == MODE_PRESENCE) {
     if (presUdpStarted) { presUdp.stop(); presUdpStarted = false; }
     presState = PRES_CONNECTING;
+  } else if (sc_mode == MODE_WEATHER) {
+    wxLeave();
   } else if (sc_mode >= 0) {
     esp_wifi_set_promiscuous(false);
   }
   sc_mode   = m;
   sc_redraw = true;
+  if (m < SCANNER_MODE_COUNT) sc_lastScannerMode = m;
+  if (m == MODE_WEATHER) {
+    shutdownWirelessSubsystems(true);
+    wxEnter();
+    sc_redraw = false;
+    return;
+  }
+  shutdownWirelessSubsystems(false);
   WiFi.mode(WIFI_STA); WiFi.disconnect(); delay(50);
   switch (m) {
     case MODE_SCAN:
@@ -877,12 +957,17 @@ static void drawHeader(const char* status, bool scanning=false) {
     gfx->setTextColor(COL_DIM);
     gfx->setCursor(labW+18,6); gfx->print(status);
   }
+
+  gfx->drawRect(SCREEN_W - 54, 2, 50, 16, COL_CYAN);
+  gfx->setTextColor(COL_CYAN);
+  gfx->setCursor(SCREEN_W - 46, 7);
+  gfx->print("RADAR");
 }
 
 static void drawFooter() {
   gfx->fillRect(0,FOOTER_Y,SCREEN_W,FOOTER_H,COL_FTR_BG);
-  int zoneW = SCREEN_W / NUM_MODES;
-  for (int i = 0; i < NUM_MODES; i++) {
+  int zoneW = SCREEN_W / SCANNER_MODE_COUNT;
+  for (int i = 0; i < SCANNER_MODE_COUNT; i++) {
     int x = i * zoneW;
     if (i>0) gfx->drawFastVLine(x,FOOTER_Y,FOOTER_H,COL_DIVIDER);
     uint16_t col = (i==sc_mode) ? COL_GREEN : COL_DIM;
@@ -1519,8 +1604,9 @@ static void redrawAll() {
     case MODE_HASH:    renderHash();    break;
     case MODE_AP:      renderAP();      break;
     case MODE_PRESENCE:renderPresence();break;
+    case MODE_WEATHER: break;
   }
-  drawFooter();
+  if (sc_mode != MODE_WEATHER) drawFooter();
   sc_redraw = false;
 }
 
@@ -1535,8 +1621,26 @@ static void handleTouch() {
   int ty = constrain(map(p.y,240,3900,0,SCREEN_H),0,SCREEN_H-1);
   ledFlash(false,true,false,60);   // green flash on touch
 
+  if (sc_mode == MODE_WEATHER) {
+    if (ty < HEADER_H) {
+      if (tx < 52) {
+        enterMode(sc_lastScannerMode);
+      } else if (tx >= SCREEN_W - 54) {
+        wxOpenSetup();
+      }
+    } else {
+      wxCycleView(tx < SCREEN_W / 2 ? -1 : 1);
+    }
+    return;
+  }
+
+  if (ty < HEADER_H && tx >= SCREEN_W - 54) {
+    enterMode(MODE_WEATHER);
+    return;
+  }
+
   if (ty >= FOOTER_Y) {
-    int zone = constrain(tx/(SCREEN_W/NUM_MODES),0,NUM_MODES-1);
+    int zone = constrain(tx/(SCREEN_W/SCANNER_MODE_COUNT),0,SCANNER_MODE_COUNT-1);
     enterMode(zone); return;
   }
   if (ty >= BODY_Y) {
@@ -1674,7 +1778,8 @@ void setup() {
   gfx->setCursor(4,108);  gfx->print("[SCAN|PROBE|CHAN|DAUTH|BLE|SHADY|HASH|AP|PRES]");
   gfx->setTextColor(COL_DIM);
   gfx->setCursor(64,128); gfx->print("Serial @ 115200 baud");
-  gfx->setCursor(64,140); gfx->print(sdOK ? "SD card: OK" : "SD card: none");
+  gfx->setCursor(28,140); gfx->print("Tap RADAR in header for weather");
+  gfx->setCursor(64,152); gfx->print(sdOK ? "SD card: OK" : "SD card: none");
   ledFlash(true,false,false,100); ledFlash(false,true,false,100); ledFlash(false,false,true,100);
   delay(1400);
 
@@ -2019,6 +2124,10 @@ void loop() {
         // Force redraw every 500ms
         if (now - presLastDraw >= 500) { presLastDraw = now; sc_redraw = true; }
       }
+      break;
+
+    case MODE_WEATHER:
+      wxLoop();
       break;
   }
 
