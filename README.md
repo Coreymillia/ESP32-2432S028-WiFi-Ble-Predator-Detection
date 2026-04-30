@@ -1,6 +1,6 @@
-# CYD Advanced WiFi & BLE Scanner
+# CYDSentinel
 
-A feature-rich wireless security scanner, sniffer, and human presence detector for the **ESP32-2432S028R (CYD — Cheap Yellow Display)**. Nine independent scanning modes accessible from a touch footer bar, including a **WiFi RF beam-break presence detection system** that actually works — no PIR sensor, no camera, no special hardware.
+A feature-rich wireless security scanner, sniffer, human presence detector, and **NEXRAD radar workspace** for the **ESP32-2432S028R (CYD — Cheap Yellow Display)**. Nine independent scanner modes stay on the touch footer bar, and the new radar view lives in the header so the same device can flip between wireless recon and local weather.
 
 > **Hardware:** ESP32-2432S028R · ILI9341 320×240 touchscreen · XPT2046 touch · RGB LED · SD card (optional)
 
@@ -8,15 +8,15 @@ A feature-rich wireless security scanner, sniffer, and human presence detector f
 
 ## Screenshots
 
-| SCAN Mode | CHAN Mode | BLE Mode |
-|-----------|-----------|----------|
-| ![SCAN](IMG_20260304_004539.jpg) | ![CHAN](IMG_20260304_004612.jpg) | ![BLE](IMG_20260304_004709.jpg) |
+| SCAN Mode | CHAN Mode | BLE Mode | RADAR Mode |
+|-----------|-----------|----------|------------|
+| ![SCAN](images/IMG_20260304_004539.jpg) | ![CHAN](images/IMG_20260304_004612.jpg) | ![BLE](images/IMG_20260304_004709.jpg) | ![RADAR](images/IMG_20260430_110636167.jpg) |
 
-*15 networks sorted by signal strength with live bars, dBm, channel, and encryption type · Channel activity heatmap hopping 1–13 · BLE device hunter showing MAC + RSSI*
+*15 networks sorted by signal strength with live bars, dBm, channel, and encryption type · Channel activity heatmap hopping 1–13 · BLE device hunter showing MAC + RSSI · Local NEXRAD radar view centered on the saved home location*
 
 | HASH Mode | AP Dashboard |
 |-----------|--------------|
-| ![HASH](IMG_20260309_231850.jpg) | ![AP](IMG_20260309_231350.jpg) |
+| ![HASH](images/IMG_20260309_231850.jpg) | ![AP](images/IMG_20260309_231350.jpg) |
 
 *HASH: dual-graph WPA handshake sniffer — packet rate bars (top) + RSSI/EAPOL/deauth dot graph (bottom), 28 APs and 4 EAPOL frames captured · AP dashboard: 2 of 3 nodes connected — NODE2 clear, NODE3 at 100% PRESENT with full red sparkline*
 
